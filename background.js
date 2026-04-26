@@ -7,6 +7,11 @@
 // { utilization, resets_at } and surface it in the popup. That keeps the
 // extension resilient when Anthropic adds another bucket.
 
+// Set to true to re-enable verbose logging + URL tracking for debugging
+// new endpoints. Off by default in production.
+const DEBUG = false;
+const dbg = (...args) => { if (DEBUG) console.log("[Claude Usage Badge]", ...args); };
+
 const DEFAULT_STATE = {
   buckets: [],          // [{ key, label, utilization, resetsAt }]
   routineRuns: null,    // { used, limit, resetsAt } | null
@@ -231,7 +236,7 @@ async function fetchRoutineRuns(orgId) {
   const { ok, data, endpoint } = await tryEndpoints(candidates);
   if (!ok || !data) return null;
 
-  console.log("[Claude Usage Badge] cowork/routines response from", endpoint, data);
+  dbg("cowork/routines response from", endpoint, data);
 
   // Shape is best-effort — try several plausible key names, then fall back
   // to walking the object looking for a used/limit pair.
@@ -314,7 +319,7 @@ async function fetchTier(orgId) {
   // Most authoritative source: subscription_details (discovered via sniffer).
   try {
     const sub = await apiFetch(`/organizations/${orgId}/subscription_details`);
-    console.log("[Claude Usage Badge] subscription_details:", sub);
+    dbg("subscription_details:", sub);
     collectTierStrings(sub, candidates);
     // Common flat fields
     for (const k of ["tier", "plan", "plan_name", "product", "subscription_tier", "name"]) {
@@ -447,6 +452,8 @@ async function mergeState(partial) {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.set({ usageState: DEFAULT_STATE });
+  // Drop diagnostic data from previous versions if present.
+  if (!DEBUG) await chrome.storage.local.remove("seenApiPaths");
   await refreshBadge();
   fetchUsageAndUpdate();
 });
@@ -481,21 +488,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
   if (msg?.type === "API_URL_SEEN") {
-    recordSeenUrl(msg.url);
+    if (DEBUG) recordSeenUrl(msg.url);
     sendResponse({ ok: true });
     return false;
   }
 });
 
-// ─── Diagnostic URL log ────────────────────────────────────────────────────
+// ─── Diagnostic URL log (DEBUG-only) ───────────────────────────────────────
 // Keeps the last 100 unique /api/ paths the page has hit (with the orgId
-// redacted so logs are sharable). Accessible via chrome.storage.local for
-// debugging which endpoint serves routine-run data.
+// redacted). Only runs when DEBUG=true above. Helpful when discovering new
+// endpoints; otherwise idle.
 async function recordSeenUrl(url) {
   if (!url) return;
   try {
     const u = new URL(url, "https://claude.ai");
-    // Redact orgId-shaped UUIDs from the path for cleaner diagnostics
     const pathRedacted = u.pathname.replace(
       /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
       "{orgId}"
@@ -504,7 +510,7 @@ async function recordSeenUrl(url) {
     if (!seenApiPaths.includes(pathRedacted)) {
       const next = [...seenApiPaths, pathRedacted].slice(-100);
       await chrome.storage.local.set({ seenApiPaths: next });
-      console.log("[Claude Usage Badge] new API path seen:", pathRedacted);
+      dbg("new API path seen:", pathRedacted);
     }
   } catch {
     // ignore
@@ -558,7 +564,7 @@ function extractRunBudget(body) {
 }
 
 async function handleSniffedPayload(url, body) {
-  console.log("[Claude Usage Badge] sniffed:", url, body);
+  dbg("sniffed:", url, body);
   if (!url || !body) return;
 
   // Only treat this as routine data if the URL path suggests it.
