@@ -29,7 +29,7 @@ The badge shows your current 5-hour session percentage at a glance. Click it for
 
 ### From the Chrome Web Store
 
-[Listing link — TODO once approved]
+**[Install Claude Usage Badge](https://chromewebstore.google.com/detail/claude-usage-badge/bdbeebogoncglnhmcmieifebjbkkfepg)**
 
 ### From source (developer mode)
 
