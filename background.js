@@ -37,6 +37,11 @@ const BUCKET_LABELS = {
   seven_day: "Weekly (all models)",
   seven_day_sonnet: "Weekly Sonnet",
   seven_day_opus: "Weekly Opus",
+  // Fable (Claude 5 family). Anthropic's per-model weekly buckets follow
+  // the pattern `seven_day_<model>`, so we pre-label both the bare name
+  // and a possible versioned variant; whichever appears in the API wins.
+  seven_day_fable: "Weekly Fable",
+  seven_day_fable_5: "Weekly Fable 5",
   // "omelette" is Claude Design's internal codename on the /usage endpoint.
   // Easter egg: kept the codename in quotes for fun.
   seven_day_omelette: "Weekly Claude Design \"omelette\"",
@@ -58,6 +63,8 @@ const BUCKET_ORDER = [
   "seven_day",
   "seven_day_sonnet",
   "seven_day_opus",
+  "seven_day_fable",
+  "seven_day_fable_5",
   "seven_day_omelette",
   "seven_day_design",
   "seven_day_claude_design",

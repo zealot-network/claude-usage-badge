@@ -313,19 +313,11 @@
   <!-- Session bucket (rendered here, always first) -->
   <div id="session-slot"></div>
 
-  <!-- Weekly / other buckets -->
-  <div id="weekly-group" style="display:none;">
-    <div class="group-heading">Weekly limits</div>
-    <div id="weekly-slot"></div>
-  </div>
+  <!-- Weekly limits — split so Extra Usage can sit right under "Weekly all models" -->
+  <div id="weekly-heading" class="group-heading" style="display:none;">Weekly limits</div>
+  <div id="weekly-primary-slot"></div>
 
-  <!-- Daily routine runs / other daily buckets -->
-  <div id="daily-group" style="display:none;">
-    <div class="group-heading">Other limits</div>
-    <div id="daily-slot"></div>
-  </div>
-
-  <!-- Extra Usage -->
+  <!-- Extra Usage (positioned mid-weekly so it shows up next to the all-models bar) -->
   <div class="extra-section" id="extra-section">
     <div class="extra-header">
       <span class="extra-label">Extra usage</span>
@@ -341,6 +333,15 @@
       </div>
       <div class="reset-time" id="extra-reset"></div>
     </div>
+  </div>
+
+  <!-- Secondary weekly buckets (Sonnet, Opus, Fable, Design, etc.) -->
+  <div id="weekly-secondary-slot"></div>
+
+  <!-- Other limits (Scheduled, OAuth apps, etc.) -->
+  <div id="daily-group" style="display:none;">
+    <div class="group-heading">Other limits</div>
+    <div id="daily-slot"></div>
   </div>
 
   <!-- Footer -->

@@ -210,19 +210,23 @@ function render(state) {
     sessionSlot.appendChild(empty);
   }
 
-  // Weekly group — any bucket starting with "seven_day" or containing "weekly"
-  const weeklyGroup = $("weekly-group");
-  const weeklySlot = $("weekly-slot");
-  weeklySlot.innerHTML = "";
+  // Weekly buckets — split across two slots so the Extra Usage card can sit
+  // between the primary "all models" bar and the per-model bars below it.
+  const weeklyHeading = $("weekly-heading");
+  const weeklyPrimarySlot = $("weekly-primary-slot");
+  const weeklySecondarySlot = $("weekly-secondary-slot");
+  weeklyPrimarySlot.innerHTML = "";
+  weeklySecondarySlot.innerHTML = "";
+
   const weeklyBuckets = (state.buckets || []).filter(
     (b) => b.key !== "five_hour" && (b.key.startsWith("seven_day") || /weekly/i.test(b.key))
   );
-  if (weeklyBuckets.length > 0) {
-    weeklyBuckets.forEach((b) => renderBucket(weeklySlot, b));
-    weeklyGroup.style.display = "";
-  } else {
-    weeklyGroup.style.display = "none";
-  }
+  const weeklyPrimary = weeklyBuckets.find((b) => b.key === "seven_day");
+  const weeklySecondary = weeklyBuckets.filter((b) => b.key !== "seven_day");
+
+  if (weeklyPrimary) renderBucket(weeklyPrimarySlot, weeklyPrimary);
+  weeklySecondary.forEach((b) => renderBucket(weeklySecondarySlot, b));
+  weeklyHeading.style.display = weeklyBuckets.length > 0 ? "" : "none";
 
   // Daily group — routine runs + any remaining buckets
   const dailyGroup = $("daily-group");
