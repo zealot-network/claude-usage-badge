@@ -2,6 +2,8 @@
 
 A Chrome extension that puts your Claude usage in your browser toolbar.
 
+> **Unofficial.** This is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" is a trademark of Anthropic, PBC, used here only to describe what the extension does.
+
 The badge shows your current 5-hour session percentage at a glance. Click it for the full breakdown — every limit your plan exposes, plus extra usage status and reset times.
 
 ## Features

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Claude Usage Badge",
-  "version": "0.3.0",
-  "description": "Toolbar badge for Claude usage: session, weekly limits (all models/Sonnet/Opus/Fable/Design), Scheduled, extra usage, and plan tier.",
+  "version": "0.3.1",
+  "description": "Unofficial Claude usage badge: session, weekly limits (all models/Sonnet/Opus/Fable/Design), extra usage, and plan tier.",
   "homepage_url": "https://github.com/zealot-network/claude-usage-badge",
   "minimum_chrome_version": "111",
   "icons": {
