@@ -22,6 +22,7 @@ const DEFAULT_STATE = {
     limitUsd: null,
     balanceUsd: null,
     utilization: null,  // server-provided % when available
+    autoReload: null,   // true/false when detectable, else null (hidden)
     resetsAt: null,
   },
   subscriptionTier: null,
@@ -45,6 +46,10 @@ const BUCKET_LABELS = {
   // and a possible versioned variant; whichever appears in the API wins.
   seven_day_fable: "Weekly Fable",
   seven_day_fable_5: "Weekly Fable 5",
+  // Mythos shares Fable's underlying model (Claude 5 family) — pre-label in
+  // case Anthropic exposes it as its own bucket.
+  seven_day_mythos: "Weekly Mythos",
+  seven_day_haiku: "Weekly Haiku",
   // "omelette" is Claude Design's internal codename on the /usage endpoint.
   // Easter egg: kept the codename in quotes for fun.
   seven_day_omelette: "Weekly Claude Design \"omelette\"",
@@ -68,6 +73,8 @@ const BUCKET_ORDER = [
   "seven_day_opus",
   "seven_day_fable",
   "seven_day_fable_5",
+  "seven_day_mythos",
+  "seven_day_haiku",
   "seven_day_omelette",
   "seven_day_design",
   "seven_day_claude_design",
@@ -207,7 +214,7 @@ function computeBadge(state) {
     parts.push(`${b.label}: ${Math.round(b.utilization)}%`);
   }
   if (extra.enabled) {
-    parts.push(inExtra ? "Extra: IN USE" : "Extra: ON");
+    parts.push(inExtra ? "Credits: IN USE" : "Credits: ON");
     if (extra.spentUsd != null && extra.limitUsd) {
       parts.push(`$${extra.spentUsd.toFixed(2)} / $${extra.limitUsd.toFixed(2)}`);
     } else if (extra.spentUsd != null) {
@@ -553,11 +560,27 @@ async function doFetchUsage(force = false) {
     );
     const extraInUse = extraEnabled && anyExhausted;
 
+    // Auto-reload status lives somewhere in extra_usage or the prepaid
+    // credits payload — field name unconfirmed, so probe common shapes and
+    // only surface a real boolean (null keeps it hidden in the popup).
+    const detectAutoReload = (o) => {
+      if (!o || typeof o !== "object") return null;
+      const candidates = [
+        o.auto_reload, o.auto_reload_enabled, o.is_auto_reload_enabled,
+        o.auto_reload?.enabled, o.auto_reload?.is_enabled,
+        o.auto_reload_settings?.enabled,
+      ];
+      for (const c of candidates) if (typeof c === "boolean") return c;
+      return null;
+    };
+
     let extraBalanceUsd = null;
+    let extraAutoReload = detectAutoReload(ex);
     if (extraEnabled) {
       try {
         const credits = await apiFetch(`/organizations/${orgId}/prepaid/credits`);
         extraBalanceUsd = credits.amount != null ? credits.amount / 100 : null;
+        if (extraAutoReload == null) extraAutoReload = detectAutoReload(credits);
       } catch {
         // Non-fatal
       }
@@ -586,6 +609,7 @@ async function doFetchUsage(force = false) {
         limitUsd: extraLimitCents / 100,
         balanceUsd: extraBalanceUsd,
         utilization: extraUtilization,
+        autoReload: extraAutoReload,
         resetsAt: extraResetsAt,
       },
       orgId,

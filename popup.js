@@ -10,6 +10,7 @@ const DEFAULT_STATE = {
     limitUsd: null,
     balanceUsd: null,
     utilization: null,
+    autoReload: null,
     resetsAt: null,
   },
   subscriptionTier: null,
@@ -306,7 +307,7 @@ function render(state) {
     detailEl.textContent = "Waiting for data…";
     barWrap.style.display = "none";
   } else if (!enabled) {
-    detailEl.textContent = "Not enabled on this plan";
+    detailEl.textContent = "Off — Claude pauses when you hit a limit";
     barWrap.style.display = "none";
   } else {
     const parts = [];
@@ -320,6 +321,8 @@ function render(state) {
     if (extra.balanceUsd != null) {
       parts.push(`$${extra.balanceUsd.toFixed(2)} balance`);
     }
+    if (extra.autoReload === true) parts.push("auto-reload on");
+    else if (extra.autoReload === false) parts.push("auto-reload off");
     detailEl.innerHTML = parts.length > 0 ? parts.join(" · ") : "Enabled — no spend data";
 
     // Monthly progress bar. Prefer the server's own utilization figure;

@@ -4,7 +4,7 @@ A Chrome extension that puts your Claude usage in your browser toolbar.
 
 > **Unofficial.** This is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic. "Claude" is a trademark of Anthropic, PBC, used here only to describe what the extension does.
 
-The badge shows your current 5-hour session percentage at a glance. Click it for the full breakdown — every limit your plan exposes, plus extra usage status and reset times.
+The badge shows your current 5-hour session percentage at a glance. Click it for the full breakdown — every limit your plan exposes, plus usage-credits status and reset times.
 
 ## Features
 
@@ -16,7 +16,7 @@ The badge shows your current 5-hour session percentage at a glance. Click it for
 - Auto-discovers any new bucket Claude adds to its `/usage` endpoint — no extension update required
 - Badge color escalates on your worst limit (session or weekly), so an exhausted weekly bucket can't hide behind a green session
 
-**Extra usage**
+**Usage credits (extra usage)**
 - ON/OFF and IN USE indicators
 - Monthly spend vs. limit with progress bar
 - Remaining prepaid balance
