@@ -154,10 +154,15 @@ function extractBuckets(usage) {
 
 // ─── Badge rendering ────────────────────────────────────────────────────────
 
-const COLOR_GREEN = "#22c55e"; // matches popup --green
-const COLOR_AMBER = "#F59E0B";
-const COLOR_RED = "#EF4444";
-const COLOR_GREY = "#666666";
+// Badge palette: deeper tones than the popup's (--green #22c55e etc.) on
+// purpose — the badge text is forced white via setBadgeTextColor, and white
+// needs a darker background to stay readable at ~9px on both light and dark
+// toolbars. Same hue family as the popup, so the traffic-light meaning holds.
+const COLOR_GREEN = "#15803D";
+const COLOR_AMBER = "#B45309";
+const COLOR_RED = "#B91C1C";
+const COLOR_GREY = "#52525B";
+const BADGE_TEXT = "#FFFFFF";
 
 function computeBadge(state) {
   const session = state.buckets.find((b) => b.key === "five_hour");
@@ -226,6 +231,13 @@ async function refreshBadge() {
   const { text, color, title } = computeBadge(state);
   await chrome.action.setBadgeText({ text });
   await chrome.action.setBadgeBackgroundColor({ color });
+  try {
+    // Chrome 110+; without this Chrome auto-picks black on our greens,
+    // which is barely readable at badge size.
+    await chrome.action.setBadgeTextColor({ color: BADGE_TEXT });
+  } catch {
+    // Very old Chrome — auto text color is the graceful fallback.
+  }
   await chrome.action.setTitle({ title });
 }
 
