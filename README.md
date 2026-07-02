@@ -9,9 +9,10 @@ The badge shows your current 5-hour session percentage at a glance. Click it for
 **Session & weekly limits**
 - Session (5-hour) bar with reset countdown
 - Weekly (7-day) bar across all models
-- Separate bars for Weekly Sonnet, Weekly Opus, and Weekly Claude Design
+- Separate bars for Weekly Sonnet, Weekly Opus, Weekly Fable, and Weekly Claude Design
 - Scheduled (cowork) and OAuth apps buckets, shown muted until first use
 - Auto-discovers any new bucket Claude adds to its `/usage` endpoint — no extension update required
+- Badge color escalates on your worst limit (session or weekly), so an exhausted weekly bucket can't hide behind a green session
 
 **Extra usage**
 - ON/OFF and IN USE indicators

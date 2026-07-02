@@ -39,20 +39,26 @@
   }
 
   // Dedupe URLs locally so we don't flood the service worker with the same
-  // path on every fetch. Background already dedupes for storage, but
-  // skipping the message entirely is cheaper.
+  // path on every fetch. Capped so a long-lived SPA tab can't grow the set
+  // without bound.
   const sentUrls = new Set();
   function forwardSeenUrl(url) {
     if (!url || sentUrls.has(url)) return;
+    if (sentUrls.size >= 500) sentUrls.clear();
     sentUrls.add(url);
     safeSend({ type: "API_URL_SEEN", url });
   }
 
-  // Bridge: listen for main-world posts from page-inject.js
+  // Bridge: listen for main-world posts from page-inject.js.
+  // Only accept messages posted by THIS window at our own origin — an
+  // embedded iframe or other frame could otherwise forge extension messages.
   window.addEventListener("message", (ev) => {
+    if (ev.source !== window) return;
+    if (ev.origin !== location.origin) return;
     const msg = ev.data;
     if (!msg || msg.__tag !== TAG) return;
     if (msg.type === "COMPLETION_SENT") {
+      // Wait a beat for the backend to settle usage counters
       setTimeout(pokeBackground, 2500);
     } else if (msg.type === "SNIFFED_PAYLOAD") {
       const { url, body } = msg.payload || {};
@@ -62,36 +68,19 @@
     }
   });
 
-  // SPA navigation observer — only start once body exists.
-  function startUrlObserver() {
-    if (!document.body) {
-      setTimeout(startUrlObserver, 100);
-      return;
+  // SPA navigation detection. A MutationObserver on document.body fired on
+  // every DOM mutation just to poll location.href — a cheap interval plus
+  // popstate covers the same ground without the churn.
+  let lastUrl = location.href;
+  function checkUrlChanged() {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(pokeBackground, 500);
     }
-    let lastUrl = location.href;
-    const urlObserver = new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        setTimeout(pokeBackground, 500);
-      }
-    });
-    urlObserver.observe(document.body, { childList: true, subtree: true });
   }
-  startUrlObserver();
+  setInterval(checkUrlChanged, 2000);
+  window.addEventListener("popstate", checkUrlChanged);
 
   // Initial poke on load
   setTimeout(pokeBackground, 1500);
-
-  // Respond to on-demand refresh from popup (only wire if the listener API
-  // is present — absent when the context has been invalidated).
-  try {
-    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-      if (msg?.type === "REQUEST_USAGE_REFRESH") {
-        pokeBackground();
-        sendResponse({ ok: true });
-      }
-    });
-  } catch {
-    // stale context — nothing to do
-  }
 })();

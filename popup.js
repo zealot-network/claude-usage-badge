@@ -9,11 +9,14 @@ const DEFAULT_STATE = {
     spentUsd: null,
     limitUsd: null,
     balanceUsd: null,
+    utilization: null,
     resetsAt: null,
   },
   subscriptionTier: null,
+  tierFetchedAt: null,
   orgId: null,
   lastUpdated: null,
+  lastErrorAt: null,
   lastError: null,
   errorCode: null,
 };
@@ -86,7 +89,9 @@ function formatLastUpdated(ts) {
   const mins = Math.round(diff / 60000);
   if (mins <= 0) return "Updated just now";
   if (mins === 1) return "Updated 1m ago";
-  return `Updated ${mins}m ago`;
+  if (mins < 60) return `Updated ${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `Updated ${hrs}h ago`;
 }
 
 function formatTier(tier) {
@@ -102,10 +107,8 @@ function formatTier(tier) {
   return map[tier] || tier;
 }
 
-// Renders one bucket (label, %, bar, reset) into the given container.
-function renderBucket(container, bucket) {
-  const inactive = !!bucket.inactive;
-  const pct = bucket.utilization;
+// Builds a bar section with ARIA progressbar semantics.
+function buildBarSection({ label, valueText, pct, resetsAt, inactive, overLimit }) {
   const fillPct = pct != null ? Math.min(100, pct) : 0;
 
   const section = document.createElement("div");
@@ -115,53 +118,69 @@ function renderBucket(container, bucket) {
       <span class="label"></span>
       <span class="value"></span>
     </div>
-    <div class="bar-track"><div class="bar-fill"></div></div>
+    <div class="bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+      <div class="bar-fill"></div>
+    </div>
     <div class="reset-time"></div>
   `;
-  section.querySelector(".label").textContent = bucket.label;
-  section.querySelector(".value").textContent = inactive ? "Not active" : formatPct(pct);
+  section.querySelector(".label").textContent = label;
+  const valueEl = section.querySelector(".value");
+  valueEl.textContent = valueText;
+  if (overLimit) valueEl.style.color = "var(--red)";
+
+  const track = section.querySelector(".bar-track");
+  track.setAttribute("aria-label", label);
+  if (pct != null) {
+    track.setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
+    if (overLimit) track.setAttribute("aria-valuetext", valueText + " — over limit");
+  } else {
+    track.setAttribute("aria-valuetext", inactive ? "Not active" : "No data");
+  }
+
   const fill = section.querySelector(".bar-fill");
   fill.style.width = `${fillPct}%`;
   fill.style.backgroundColor = pct != null ? barColor(pct) : "var(--surface)";
-  section.querySelector(".reset-time").textContent = inactive
-    ? ""
-    : formatResetTime(bucket.resetsAt);
+  section.querySelector(".reset-time").textContent = inactive ? "" : formatResetTime(resetsAt);
 
-  container.appendChild(section);
+  return section;
 }
 
-// Renders the routine-runs bucket (uses used/limit rather than %).
+// Renders one bucket (label, %, bar, reset) into the given container.
+function renderBucket(container, bucket) {
+  const inactive = !!bucket.inactive;
+  const pct = bucket.utilization;
+  container.appendChild(
+    buildBarSection({
+      label: bucket.label,
+      valueText: inactive ? "Not active" : formatPct(pct),
+      pct,
+      resetsAt: bucket.resetsAt,
+      inactive,
+      overLimit: pct != null && pct > 100,
+    })
+  );
+}
+
+// Renders the Scheduled/run-budget bucket (uses used/limit rather than %).
 function renderRoutineRuns(container, runs) {
   const { used, limit, resetsAt } = runs;
   let pct = null;
   if (used != null && limit != null && limit > 0) {
     pct = (used / limit) * 100;
   }
-  const fillPct = pct != null ? Math.min(100, pct) : 0;
   const valueText =
-    used != null && limit != null
-      ? `${used} / ${limit}`
-      : used != null
-      ? `${used}`
-      : "—";
+    used != null && limit != null ? `${used} / ${limit}` : used != null ? `${used}` : "—";
 
-  const section = document.createElement("div");
-  section.className = "section";
-  section.innerHTML = `
-    <div class="label-row">
-      <span class="label">Routine runs</span>
-      <span class="value"></span>
-    </div>
-    <div class="bar-track"><div class="bar-fill"></div></div>
-    <div class="reset-time"></div>
-  `;
-  section.querySelector(".value").textContent = valueText;
-  const fill = section.querySelector(".bar-fill");
-  fill.style.width = `${fillPct}%`;
-  fill.style.backgroundColor = pct != null ? barColor(pct) : "var(--surface)";
-  section.querySelector(".reset-time").textContent = formatResetTime(resetsAt);
-
-  container.appendChild(section);
+  container.appendChild(
+    buildBarSection({
+      label: "Scheduled runs",
+      valueText,
+      pct,
+      resetsAt,
+      inactive: false,
+      overLimit: pct != null && pct > 100,
+    })
+  );
 }
 
 // ─── Render ─────────────────────────────────────────────────────────────────
@@ -188,14 +207,18 @@ function render(state) {
   const errorEl = $("error-label");
   // When the prompt is shown, suppress the small inline error to avoid redundancy.
   if (state.lastError && !showPrompt) {
-    errorEl.textContent = state.lastError;
+    errorEl.textContent = `Last refresh failed: ${state.lastError}`;
     errorEl.style.display = "block";
   } else {
     errorEl.style.display = "none";
   }
 
   // Tier
-  $("tier-pill").textContent = formatTier(state.subscriptionTier);
+  const tierEl = $("tier-pill");
+  tierEl.textContent = formatTier(state.subscriptionTier);
+  tierEl.title = state.subscriptionTier
+    ? "Detected Claude plan"
+    : "Plan not detected yet — open claude.ai and refresh";
 
   // Session (5h) — always first slot
   const sessionSlot = $("session-slot");
@@ -203,7 +226,7 @@ function render(state) {
   const session = (state.buckets || []).find((b) => b.key === "five_hour");
   if (session) {
     renderBucket(sessionSlot, session);
-  } else {
+  } else if (!showPrompt) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No session data yet";
@@ -214,21 +237,31 @@ function render(state) {
   // between the primary "all models" bar and the per-model bars below it.
   const weeklyHeading = $("weekly-heading");
   const weeklyPrimarySlot = $("weekly-primary-slot");
+  const weeklySecondaryHeading = $("weekly-secondary-heading");
   const weeklySecondarySlot = $("weekly-secondary-slot");
   weeklyPrimarySlot.innerHTML = "";
   weeklySecondarySlot.innerHTML = "";
+
+  // Weekly buckets that aren't per-model (Scheduled, OAuth apps) belong under
+  // "Other limits", not the "By model" sub-heading.
+  const NON_MODEL_WEEKLY = new Set(["seven_day_cowork", "seven_day_oauth_apps"]);
 
   const weeklyBuckets = (state.buckets || []).filter(
     (b) => b.key !== "five_hour" && (b.key.startsWith("seven_day") || /weekly/i.test(b.key))
   );
   const weeklyPrimary = weeklyBuckets.find((b) => b.key === "seven_day");
-  const weeklySecondary = weeklyBuckets.filter((b) => b.key !== "seven_day");
+  const weeklyModels = weeklyBuckets.filter(
+    (b) => b.key !== "seven_day" && !NON_MODEL_WEEKLY.has(b.key)
+  );
+  const weeklyNonModel = weeklyBuckets.filter((b) => NON_MODEL_WEEKLY.has(b.key));
 
   if (weeklyPrimary) renderBucket(weeklyPrimarySlot, weeklyPrimary);
-  weeklySecondary.forEach((b) => renderBucket(weeklySecondarySlot, b));
+  weeklyModels.forEach((b) => renderBucket(weeklySecondarySlot, b));
   weeklyHeading.style.display = weeklyBuckets.length > 0 ? "" : "none";
+  weeklySecondaryHeading.style.display = weeklyModels.length > 0 ? "" : "none";
 
-  // Daily group — routine runs + any remaining buckets
+  // Other limits — Scheduled runs, non-model weekly buckets, and anything
+  // that isn't session/weekly-model.
   const dailyGroup = $("daily-group");
   const dailySlot = $("daily-slot");
   dailySlot.innerHTML = "";
@@ -238,31 +271,42 @@ function render(state) {
       !b.key.startsWith("seven_day") &&
       !/weekly/i.test(b.key)
   );
+  weeklyNonModel.forEach((b) => renderBucket(dailySlot, b));
   otherBuckets.forEach((b) => renderBucket(dailySlot, b));
   if (state.routineRuns) {
     renderRoutineRuns(dailySlot, state.routineRuns);
   }
   dailyGroup.style.display = dailySlot.children.length > 0 ? "" : "none";
 
-  // Extra usage
+  // Extra usage. enabled is tri-state: null = unknown (no data yet).
   const extra = state.extraUsage || {};
-  const enabled = !!extra.enabled;
+  const extraKnown = extra.enabled === true || extra.enabled === false;
+  const enabled = extra.enabled === true;
   const inUse = !!extra.inUse;
 
   const enabledPill = $("extra-enabled-pill");
-  enabledPill.textContent = enabled ? "ON" : "OFF";
-  enabledPill.classList.remove("pill-on", "pill-off");
-  enabledPill.classList.add(enabled ? "pill-on" : "pill-off");
+  enabledPill.classList.remove("pill-on", "pill-off", "pill-neutral");
+  if (!extraKnown) {
+    enabledPill.textContent = "—";
+    enabledPill.classList.add("pill-neutral");
+  } else {
+    enabledPill.textContent = enabled ? "ON" : "OFF";
+    enabledPill.classList.add(enabled ? "pill-on" : "pill-off");
+  }
 
   $("extra-active-pill").style.display = enabled && inUse ? "inline" : "none";
 
   const detailEl = $("extra-detail");
   const barWrap = $("extra-bar-wrap");
   const extraBar = $("extra-bar");
+  const extraBarTrack = $("extra-bar-track");
   const extraResetEl = $("extra-reset");
 
-  if (!enabled) {
-    detailEl.innerHTML = "Not enabled on this plan";
+  if (!extraKnown) {
+    detailEl.textContent = "Waiting for data…";
+    barWrap.style.display = "none";
+  } else if (!enabled) {
+    detailEl.textContent = "Not enabled on this plan";
     barWrap.style.display = "none";
   } else {
     const parts = [];
@@ -278,12 +322,20 @@ function render(state) {
     }
     detailEl.innerHTML = parts.length > 0 ? parts.join(" · ") : "Enabled — no spend data";
 
-    // Monthly limit progress bar
-    if (extra.limitUsd != null && extra.limitUsd > 0 && extra.spentUsd != null) {
-      const pct = (extra.spentUsd / extra.limitUsd) * 100;
-      const fillPct = Math.min(100, pct);
-      extraBar.style.width = `${fillPct}%`;
+    // Monthly progress bar. Prefer the server's own utilization figure;
+    // fall back to spent/limit.
+    let pct = null;
+    if (typeof extra.utilization === "number") {
+      pct = extra.utilization;
+    } else if (extra.limitUsd != null && extra.limitUsd > 0 && extra.spentUsd != null) {
+      pct = (extra.spentUsd / extra.limitUsd) * 100;
+    }
+    if (pct != null) {
+      extraBar.style.width = `${Math.min(100, pct)}%`;
       extraBar.style.backgroundColor = barColor(pct);
+      if (extraBarTrack) {
+        extraBarTrack.setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
+      }
       extraResetEl.textContent = formatResetTime(extra.resetsAt);
       barWrap.style.display = "";
     } else {
@@ -291,11 +343,19 @@ function render(state) {
     }
   }
 
-  // Meta
+  // Meta — reflects the last SUCCESSFUL fetch only; errors are shown separately.
   $("meta-label").textContent = formatLastUpdated(state.lastUpdated);
 }
 
 // ─── Init ───────────────────────────────────────────────────────────────────
+
+function normalizeState(state) {
+  return {
+    ...DEFAULT_STATE,
+    ...(state || {}),
+    extraUsage: { ...DEFAULT_STATE.extraUsage, ...((state && state.extraUsage) || {}) },
+  };
+}
 
 async function loadAndRender() {
   try {
@@ -310,7 +370,7 @@ async function loadAndRender() {
         }
       });
     });
-    render({ ...DEFAULT_STATE, ...state, extraUsage: { ...DEFAULT_STATE.extraUsage, ...(state.extraUsage || {}) } });
+    render(normalizeState(state));
   } catch {
     document.getElementById("error-label").textContent = "Failed to load state.";
     document.getElementById("error-label").style.display = "block";
@@ -320,17 +380,37 @@ async function loadAndRender() {
 document.addEventListener("DOMContentLoaded", () => {
   loadAndRender();
 
-  document.getElementById("refresh-btn").addEventListener("click", () => {
-    const btn = document.getElementById("refresh-btn");
+  // Live updates: re-render whenever the background writes new state, and
+  // tick the relative timestamps while the popup stays open.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.usageState) {
+      render(normalizeState(changes.usageState.newValue));
+    }
+  });
+  setInterval(loadAndRender, 30_000);
+
+  const btn = document.getElementById("refresh-btn");
+  btn.addEventListener("click", () => {
     btn.textContent = "…";
     btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
 
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      loadAndRender();
+      btn.textContent = "Refresh";
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+    };
+    // The background responds when the fetch actually finishes — re-render
+    // then, with a safety timeout in case the worker dies mid-request.
+    const safety = setTimeout(done, 10_000);
     chrome.runtime.sendMessage({ type: "FORCE_REFRESH" }, () => {
-      setTimeout(() => {
-        loadAndRender();
-        btn.textContent = "Refresh";
-        btn.disabled = false;
-      }, 1500);
+      void chrome.runtime.lastError; // swallow; state read still works
+      clearTimeout(safety);
+      done();
     });
   });
 

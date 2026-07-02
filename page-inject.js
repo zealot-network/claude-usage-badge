@@ -14,21 +14,31 @@
   const SNIFF_PATTERNS = [
     /\/routines?\b/i,
     /\/run[-_]?budget/i,
-    /\/agent[s]?\b.*budget/i,
-    /\/budget/i,
+    /\/cowork/i,
     /\/usage/i,
     /\/schedule[ds]?\b/i,
     /\/scheduled[-_]?tasks?\b/i,
     /\/automations?\b/i,
-    /\/cron/i,
-    /\/task[s]?\b.*budget/i,
   ];
 
   function post(type, payload) {
     try {
-      window.postMessage({ __tag: TAG, type, payload }, "*");
+      // Same-window bridge only — scope to our own origin, never "*".
+      window.postMessage({ __tag: TAG, type, payload }, location.origin);
     } catch {
       // ignore
+    }
+  }
+
+  // fetch() accepts strings, URL objects, and Request objects.
+  function urlOf(input) {
+    try {
+      if (typeof input === "string") return input;
+      if (input instanceof Request) return input.url;
+      if (input instanceof URL) return input.href;
+      return input != null ? String(input) : null;
+    } catch {
+      return null;
     }
   }
 
@@ -41,8 +51,8 @@
       }
 
       if (url.includes("/api/")) {
-        // Always log the URL (no body) for diagnostics so we can find the
-        // routine-runs endpoint by inspection if heuristics miss it.
+        // Log the URL (no body) for diagnostics so new endpoints can be
+        // discovered by inspection if the sniff patterns miss them.
         post("API_URL_SEEN", { url });
 
         if (SNIFF_PATTERNS.some((p) => p.test(url))) {
@@ -63,8 +73,7 @@
   if (originalFetch) {
     window.fetch = async function (...args) {
       const response = await originalFetch.apply(this, args);
-      const url = typeof args[0] === "string" ? args[0] : args[0]?.url;
-      handleResponse(url, response);
+      handleResponse(urlOf(args[0]), response);
       return response;
     };
   }
@@ -77,7 +86,14 @@
     const origSend = XHR.prototype.send;
 
     XHR.prototype.open = function (method, url, ...rest) {
-      this.__cub_url = url;
+      // Non-enumerable so the marker doesn't show up in page code that
+      // iterates XHR instances.
+      Object.defineProperty(this, "__cub_url", {
+        value: typeof url === "string" ? url : urlOf(url),
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
       return origOpen.call(this, method, url, ...rest);
     };
 
