@@ -17,10 +17,11 @@ The badge shows your current 5-hour session percentage at a glance. Click it for
 - Badge color escalates on your worst limit (session or weekly), so an exhausted weekly bucket can't hide behind a green session
 
 **Usage credits (extra usage)**
-- ON/OFF and IN USE indicators
-- Monthly spend vs. limit with progress bar
-- Remaining prepaid balance
-- Reset date
+- ON / PAUSED / OFF status, with IN USE and over-limit indicators
+- Monthly spend vs. limit with progress bar — shows true % even when over 100
+- Over-limit state is flagged loudly (red card) because that's real money
+- Remaining prepaid balance and auto-reload status
+- Understands the "paused because you hit the cap" state, not just on/off
 
 **Subscription tier**
 - Accurate plan pill: Free, Pro, Team, Enterprise, Max 5×, Max 20×

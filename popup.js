@@ -8,8 +8,13 @@ const DEFAULT_STATE = {
     inUse: null,
     spentUsd: null,
     limitUsd: null,
+    status: null,
+    disabledReason: null,
+    overLimit: null,
     balanceUsd: null,
     utilization: null,
+    severity: null,
+    canToggle: null,
     autoReload: null,
     resetsAt: null,
   },
@@ -108,8 +113,16 @@ function formatTier(tier) {
   return map[tier] || tier;
 }
 
+// Maps the API's severity string to a bar color, falling back to % bands.
+function severityColor(severity, pct) {
+  if (severity === "critical") return "var(--red)";
+  if (severity === "warning") return "var(--amber)";
+  if (severity === "normal") return "var(--green)";
+  return barColor(pct);
+}
+
 // Builds a bar section with ARIA progressbar semantics.
-function buildBarSection({ label, valueText, pct, resetsAt, inactive, overLimit }) {
+function buildBarSection({ label, valueText, pct, resetsAt, inactive, overLimit, severity }) {
   const fillPct = pct != null ? Math.min(100, pct) : 0;
 
   const section = document.createElement("div");
@@ -140,7 +153,7 @@ function buildBarSection({ label, valueText, pct, resetsAt, inactive, overLimit 
 
   const fill = section.querySelector(".bar-fill");
   fill.style.width = `${fillPct}%`;
-  fill.style.backgroundColor = pct != null ? barColor(pct) : "var(--surface)";
+  fill.style.backgroundColor = pct != null ? severityColor(severity, pct) : "var(--surface)";
   section.querySelector(".reset-time").textContent = inactive ? "" : formatResetTime(resetsAt);
 
   return section;
@@ -158,6 +171,7 @@ function renderBucket(container, bucket) {
       resetsAt: bucket.resetsAt,
       inactive,
       overLimit: pct != null && pct > 100,
+      severity: bucket.severity,
     })
   );
 }
@@ -279,23 +293,41 @@ function render(state) {
   }
   dailyGroup.style.display = dailySlot.children.length > 0 ? "" : "none";
 
-  // Extra usage. enabled is tri-state: null = unknown (no data yet).
+  // ── Usage credits — status-aware (on / paused / off / unknown) ────────────
   const extra = state.extraUsage || {};
-  const extraKnown = extra.enabled === true || extra.enabled === false;
-  const enabled = extra.enabled === true;
+  // status is authoritative when present; fall back to the enabled boolean.
+  let status = extra.status;
+  if (status == null) {
+    if (extra.enabled === true) status = "on";
+    else if (extra.enabled === false) status = "off";
+  }
+  const known = status != null;
+  const active = status === "on" || status === "paused";
   const inUse = !!extra.inUse;
+  const overLimit = extra.overLimit === true;
 
+  const section = $("extra-section");
+  section.classList.toggle("over-limit", overLimit);
+
+  // Status pill
   const enabledPill = $("extra-enabled-pill");
-  enabledPill.classList.remove("pill-on", "pill-off", "pill-neutral");
-  if (!extraKnown) {
+  enabledPill.classList.remove("pill-on", "pill-off", "pill-neutral", "pill-paused");
+  if (!known) {
     enabledPill.textContent = "—";
     enabledPill.classList.add("pill-neutral");
+  } else if (status === "on") {
+    enabledPill.textContent = "ON";
+    enabledPill.classList.add("pill-on");
+  } else if (status === "paused") {
+    enabledPill.textContent = overLimit ? "OVER LIMIT" : "PAUSED";
+    enabledPill.classList.add("pill-paused");
   } else {
-    enabledPill.textContent = enabled ? "ON" : "OFF";
-    enabledPill.classList.add(enabled ? "pill-on" : "pill-off");
+    enabledPill.textContent = "OFF";
+    enabledPill.classList.add("pill-off");
   }
 
-  $("extra-active-pill").style.display = enabled && inUse ? "inline" : "none";
+  // "IN USE" only when actively drawing (on + a limit exhausted).
+  $("extra-active-pill").style.display = status === "on" && inUse ? "inline" : "none";
 
   const detailEl = $("extra-detail");
   const barWrap = $("extra-bar-wrap");
@@ -303,41 +335,56 @@ function render(state) {
   const extraBarTrack = $("extra-bar-track");
   const extraResetEl = $("extra-reset");
 
-  if (!extraKnown) {
+  if (!known) {
     detailEl.textContent = "Waiting for data…";
     barWrap.style.display = "none";
-  } else if (!enabled) {
+  } else if (!active) {
     detailEl.textContent = "Off — Claude pauses when you hit a limit";
     barWrap.style.display = "none";
   } else {
+    const uPct = typeof extra.utilization === "number" ? Math.round(extra.utilization) : null;
     const parts = [];
     if (extra.spentUsd != null && extra.limitUsd != null && extra.limitUsd > 0) {
+      const pctTag =
+        uPct != null
+          ? ` · <span class="${overLimit ? "over" : ""}">${uPct}%</span>`
+          : "";
       parts.push(
-        `<strong>$${extra.spentUsd.toFixed(2)}</strong> of $${extra.limitUsd.toFixed(2)} monthly`
+        `<strong>$${extra.spentUsd.toFixed(2)}</strong> of $${extra.limitUsd.toFixed(2)}${pctTag}`
       );
     } else if (extra.spentUsd != null) {
       parts.push(`<strong>$${extra.spentUsd.toFixed(2)}</strong> spent`);
     }
-    if (extra.balanceUsd != null) {
-      parts.push(`$${extra.balanceUsd.toFixed(2)} balance`);
-    }
-    if (extra.autoReload === true) parts.push("auto-reload on");
-    else if (extra.autoReload === false) parts.push("auto-reload off");
-    detailEl.innerHTML = parts.length > 0 ? parts.join(" · ") : "Enabled — no spend data";
+    const line2 = [];
+    if (extra.balanceUsd != null) line2.push(`$${extra.balanceUsd.toFixed(2)} balance`);
+    if (extra.autoReload === true) line2.push("auto-reload on");
+    else if (extra.autoReload === false) line2.push("auto-reload off");
 
-    // Monthly progress bar. Prefer the server's own utilization figure;
-    // fall back to spent/limit.
+    let html = parts.join(" · ") || "Enabled — no spend data";
+    if (line2.length) html += `<div class="extra-sub">${line2.join(" · ")}</div>`;
+    // Paused/over-limit gets an explicit, louder note.
+    if (status === "paused") {
+      const note = overLimit
+        ? "Over your monthly limit — credits paused"
+        : "Credits paused";
+      html += `<div class="extra-note">${note}</div>`;
+    }
+    detailEl.innerHTML = html;
+
+    // Progress bar — uncapped utilization, red when over limit.
     let pct = null;
-    if (typeof extra.utilization === "number") {
-      pct = extra.utilization;
-    } else if (extra.limitUsd != null && extra.limitUsd > 0 && extra.spentUsd != null) {
+    if (typeof extra.utilization === "number") pct = extra.utilization;
+    else if (extra.limitUsd != null && extra.limitUsd > 0 && extra.spentUsd != null) {
       pct = (extra.spentUsd / extra.limitUsd) * 100;
     }
     if (pct != null) {
       extraBar.style.width = `${Math.min(100, pct)}%`;
-      extraBar.style.backgroundColor = barColor(pct);
+      extraBar.style.backgroundColor = severityColor(extra.severity, pct);
       if (extraBarTrack) {
         extraBarTrack.setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
+        if (overLimit) {
+          extraBarTrack.setAttribute("aria-valuetext", `${Math.round(pct)}% — over limit`);
+        }
       }
       extraResetEl.textContent = formatResetTime(extra.resetsAt);
       barWrap.style.display = "";

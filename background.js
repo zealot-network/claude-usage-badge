@@ -17,11 +17,16 @@ const DEFAULT_STATE = {
   routineRuns: null,    // { used, limit, resetsAt } | null
   extraUsage: {
     enabled: null,      // null = unknown (no data yet), false = off, true = on
+    status: null,       // "on" | "paused" | "off" | null
+    disabledReason: null,
     inUse: null,
+    overLimit: null,
     spentUsd: null,
     limitUsd: null,
     balanceUsd: null,
-    utilization: null,  // server-provided % when available
+    utilization: null,  // uncapped % (can exceed 100)
+    severity: null,
+    canToggle: null,
     autoReload: null,   // true/false when detectable, else null (hidden)
     resetsAt: null,
   },
@@ -115,6 +120,60 @@ function isPlausibleBucketKey(key) {
   );
 }
 
+// { amount_minor, exponent } → dollars. The /usage `spend` object and its
+// nested caps/balances all use this minor-unit shape.
+function minorToUsd(m) {
+  if (!m || typeof m !== "object" || typeof m.amount_minor !== "number") return null;
+  const exp = typeof m.exponent === "number" ? m.exponent : 2;
+  return m.amount_minor / Math.pow(10, exp);
+}
+
+// Preferred bucket source: the structured `limits` array added in mid-2026.
+// Each entry is { kind, group, percent, severity, resets_at, scope, is_active }.
+// weekly_scoped entries carry scope.model.display_name (e.g. "Fable"), so we
+// get real model names with no codename guessing. We map onto the existing
+// key scheme (five_hour / seven_day / seven_day_<model>) so popup routing and
+// the badge keep working unchanged.
+function bucketsFromLimits(limits) {
+  const out = [];
+  for (const l of limits) {
+    if (!l || typeof l !== "object") continue;
+    const pct = typeof l.percent === "number" ? l.percent : null;
+    let key, label;
+    if (l.kind === "session") {
+      key = "five_hour";
+      label = "Session (5h)";
+    } else if (l.kind === "weekly_all") {
+      key = "seven_day";
+      label = "Weekly (all models)";
+    } else if (l.kind === "weekly_scoped") {
+      const name = l.scope?.model?.display_name || l.scope?.surface;
+      const slug = name
+        ? String(name).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
+        : "scoped";
+      key = "seven_day_" + slug;
+      label = name ? "Weekly " + name : "Weekly (scoped)";
+    } else {
+      // Unknown kind — surface it rather than drop it.
+      key = l.kind || "unknown";
+      label = labelFor(key);
+    }
+    out.push({
+      key,
+      label,
+      utilization: pct,
+      resetsAt: toEpoch(l.resets_at),
+      severity: typeof l.severity === "string" ? l.severity : null,
+      active: l.is_active === true,
+      inactive: false,
+    });
+  }
+  // session first, weekly (all) next, scoped models after — stable otherwise.
+  const rank = (k) => (k === "five_hour" ? 0 : k === "seven_day" ? 1 : 2);
+  out.sort((a, b) => rank(a.key) - rank(b.key));
+  return out;
+}
+
 function extractBuckets(usage) {
   if (!usage || typeof usage !== "object") return [];
   const out = [];
@@ -189,34 +248,49 @@ function computeBadge(state) {
     return { text: "", color: COLOR_GREY, title: "Claude Usage Badge — no data yet" };
   }
 
-  const pct = Math.min(999, Math.round(sessionPct));
   const inExtra = !!extra.inUse;
-  const text = `${pct}%`;
 
-  // Color escalates on the WORST of session or any weekly bucket, not just
-  // the session — a green badge over an exhausted weekly limit is a lie.
-  // Scoped to session + weekly so a promo/daily bucket can't force red.
+  // The badge shows the MOST-CONSTRAINED limit (session or any weekly), not
+  // always the session — otherwise an exhausted weekly (e.g. Fable at 100%)
+  // hides behind a low session number. This keeps the "never hit a limit by
+  // surprise" promise: the badge number is the one you most need to watch.
   let worst = sessionPct;
+  let worstSeverity = null;
   for (const b of state.buckets) {
     const counts = b.key === "five_hour" || b.key.startsWith("seven_day");
-    if (counts && b.utilization != null && b.utilization > worst) worst = b.utilization;
+    if (counts && b.utilization != null && b.utilization > worst) {
+      worst = b.utilization;
+      worstSeverity = b.severity || null;
+    }
   }
 
+  const pct = Math.min(999, Math.round(worst));
+  const text = `${pct}%`;
+
+  // Prefer the API's own severity for the worst limit; fall back to % bands.
   let color;
-  if (inExtra)          color = COLOR_RED;
+  if (inExtra || extra.overLimit) color = COLOR_RED;
+  else if (worstSeverity === "critical") color = COLOR_RED;
+  else if (worstSeverity === "warning")  color = COLOR_AMBER;
+  else if (worstSeverity === "normal")   color = COLOR_GREEN;
   else if (worst >= 90) color = COLOR_RED;
   else if (worst >= 70) color = COLOR_AMBER;
   else                  color = COLOR_GREEN;
 
-  const parts = [`Session: ${pct}%`];
+  const parts = [`Session: ${Math.round(sessionPct)}%`];
   for (const b of state.buckets) {
     if (b.key === "five_hour" || b.utilization == null) continue;
     parts.push(`${b.label}: ${Math.round(b.utilization)}%`);
   }
-  if (extra.enabled) {
-    parts.push(inExtra ? "Credits: IN USE" : "Credits: ON");
+  if (extra.status === "on" || extra.status === "paused") {
+    const label =
+      extra.status === "paused"
+        ? (extra.overLimit ? "Credits: OVER LIMIT" : "Credits: PAUSED")
+        : (inExtra ? "Credits: IN USE" : "Credits: ON");
+    parts.push(label);
     if (extra.spentUsd != null && extra.limitUsd) {
-      parts.push(`$${extra.spentUsd.toFixed(2)} / $${extra.limitUsd.toFixed(2)}`);
+      const upct = extra.utilization != null ? ` (${Math.round(extra.utilization)}%)` : "";
+      parts.push(`$${extra.spentUsd.toFixed(2)} / $${extra.limitUsd.toFixed(2)}${upct}`);
     } else if (extra.spentUsd != null) {
       parts.push(`~$${extra.spentUsd.toFixed(2)} spent`);
     }
@@ -544,25 +618,80 @@ async function doFetchUsage(force = false) {
     }
 
     const usage = await apiFetch(`/organizations/${orgId}/usage`);
-    const buckets = extractBuckets(usage);
 
-    const ex = usage.extra_usage || {};
-    const extraEnabled = ex.is_enabled ?? false;
-    const extraSpentCents = ex.used_credits ?? 0;
-    const extraLimitCents = ex.monthly_limit ?? 0;
-    const extraUtilization = typeof ex.utilization === "number" ? ex.utilization : null;
-    const extraResetsAt = toEpoch(ex.resets_at ?? ex.monthly_reset_at);
+    // Prefer the structured `limits` array (real model names + severity).
+    // Fall back to legacy top-level bucket keys for older payload shapes.
+    const buckets =
+      Array.isArray(usage.limits) && usage.limits.length
+        ? bucketsFromLimits(usage.limits)
+        : extractBuckets(usage);
 
-    // Extra usage engages when ANY limit bucket is exhausted — weekly
-    // exhaustion bills extra credits even while the session bucket is low.
+    // ── Usage credits (formerly "extra usage") ──────────────────────────────
+    // The `spend` object is the authoritative source; `extra_usage` is the
+    // legacy fallback. spend gives us used/limit as minor units, a real
+    // enabled flag, disabled_reason, and severity.
+    const spend = usage.spend && typeof usage.spend === "object" ? usage.spend : null;
+    const exLegacy = usage.extra_usage || usage.usage_credits || {};
+
+    let extraEnabled, extraSpentUsd, extraLimitUsd, creditsPercentRaw,
+        disabledReason, extraSeverity, canToggle, autoReloadRaw,
+        balanceRaw, extraResetsAt;
+
+    if (spend) {
+      extraSpentUsd = minorToUsd(spend.used);
+      extraLimitUsd =
+        minorToUsd(spend.limit) ??
+        minorToUsd(spend.cap?.credits) ??
+        minorToUsd(spend.cap?.money);
+      extraEnabled = typeof spend.enabled === "boolean" ? spend.enabled : null;
+      disabledReason = typeof spend.disabled_reason === "string" ? spend.disabled_reason : null;
+      creditsPercentRaw = typeof spend.percent === "number" ? spend.percent : null;
+      extraSeverity = typeof spend.severity === "string" ? spend.severity : null;
+      canToggle = spend.can_toggle === true;
+      autoReloadRaw = typeof spend.auto_reload === "boolean" ? spend.auto_reload : null;
+      balanceRaw = minorToUsd(spend.balance);
+      extraResetsAt = toEpoch(spend.resets_at ?? spend.reset_at);
+    } else {
+      extraEnabled = typeof exLegacy.is_enabled === "boolean" ? exLegacy.is_enabled : null;
+      extraSpentUsd = exLegacy.used_credits != null ? exLegacy.used_credits / 100 : null;
+      extraLimitUsd = exLegacy.monthly_limit != null ? exLegacy.monthly_limit / 100 : null;
+      creditsPercentRaw = typeof exLegacy.utilization === "number" ? exLegacy.utilization : null;
+      disabledReason = typeof exLegacy.disabled_reason === "string" ? exLegacy.disabled_reason : null;
+      extraSeverity = null;
+      canToggle = null;
+      autoReloadRaw = null;
+      balanceRaw = null;
+      extraResetsAt = toEpoch(exLegacy.resets_at ?? exLegacy.monthly_reset_at);
+    }
+
+    // TRUE utilization (uncapped) so 107%-over-limit shows honestly; the API
+    // caps percent at 100.
+    const extraUtilization =
+      extraSpentUsd != null && extraLimitUsd > 0
+        ? (extraSpentUsd / extraLimitUsd) * 100
+        : creditsPercentRaw;
+    const extraOverLimit =
+      extraSpentUsd != null && extraLimitUsd != null && extraSpentUsd > extraLimitUsd;
+
+    // Three-state status: on / paused (disabled with a reason, e.g. over the
+    // cap) / off (user-disabled, no reason) / null (unknown).
+    let creditsStatus;
+    if (extraEnabled === true) creditsStatus = "on";
+    else if (extraEnabled === false && disabledReason) creditsStatus = "paused";
+    else if (extraEnabled === false) creditsStatus = "off";
+    else creditsStatus = null;
+
+    // "IN USE" = credits on AND a limit is currently exhausted (actively
+    // drawing). Paused/over-limit is a separate, louder state.
     const anyExhausted = buckets.some(
       (b) => b.utilization != null && b.utilization >= 100
     );
-    const extraInUse = extraEnabled && anyExhausted;
+    const extraInUse = extraEnabled === true && anyExhausted;
 
-    // Auto-reload status lives somewhere in extra_usage or the prepaid
-    // credits payload — field name unconfirmed, so probe common shapes and
-    // only surface a real boolean (null keeps it hidden in the popup).
+    // Balance + auto-reload aren't always in /usage (both null above for this
+    // user) — pull from prepaid/credits when credits are relevant (on OR
+    // paused: a paused-over-limit user still has a prepaid balance worth
+    // showing).
     const detectAutoReload = (o) => {
       if (!o || typeof o !== "object") return null;
       const candidates = [
@@ -574,12 +703,14 @@ async function doFetchUsage(force = false) {
       return null;
     };
 
-    let extraBalanceUsd = null;
-    let extraAutoReload = detectAutoReload(ex);
-    if (extraEnabled) {
+    let extraBalanceUsd = balanceRaw;
+    let extraAutoReload = autoReloadRaw;
+    if (creditsStatus === "on" || creditsStatus === "paused") {
       try {
         const credits = await apiFetch(`/organizations/${orgId}/prepaid/credits`);
-        extraBalanceUsd = credits.amount != null ? credits.amount / 100 : null;
+        if (extraBalanceUsd == null) {
+          extraBalanceUsd = credits.amount != null ? credits.amount / 100 : null;
+        }
         if (extraAutoReload == null) extraAutoReload = detectAutoReload(credits);
       } catch {
         // Non-fatal
@@ -604,11 +735,16 @@ async function doFetchUsage(force = false) {
       buckets,
       extraUsage: {
         enabled: extraEnabled,
+        status: creditsStatus,          // "on" | "paused" | "off" | null
+        disabledReason,
         inUse: extraInUse,
-        spentUsd: extraSpentCents / 100,
-        limitUsd: extraLimitCents / 100,
+        overLimit: extraOverLimit,
+        spentUsd: extraSpentUsd,
+        limitUsd: extraLimitUsd,
         balanceUsd: extraBalanceUsd,
-        utilization: extraUtilization,
+        utilization: extraUtilization,  // uncapped (can exceed 100)
+        severity: extraSeverity,
+        canToggle,
         autoReload: extraAutoReload,
         resetsAt: extraResetsAt,
       },

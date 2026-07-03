@@ -160,6 +160,12 @@
       border-radius: 6px;
     }
 
+    /* Over the monthly limit — tint the whole card so it can't be missed. */
+    .extra-section.over-limit {
+      background: rgba(239, 68, 68, 0.07);
+      border-color: rgba(239, 68, 68, 0.4);
+    }
+
     .extra-header {
       display: flex;
       justify-content: space-between;
@@ -210,6 +216,13 @@
       border: 1px solid rgba(245, 158, 11, 0.3);
     }
 
+    /* Paused / over-limit — credits were on but are currently disabled. */
+    .pill-paused {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--red);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+    }
+
     .extra-detail {
       font-size: 11px;
       color: var(--text);
@@ -219,6 +232,22 @@
     .extra-detail strong {
       color: var(--text);
       font-weight: 700;
+    }
+
+    .extra-detail .over {
+      color: var(--red);
+      font-weight: 700;
+    }
+
+    .extra-sub {
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .extra-note {
+      margin-top: 4px;
+      color: var(--red);
+      font-weight: 600;
     }
 
     .extra-bar-wrap {
