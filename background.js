@@ -250,18 +250,20 @@ function computeBadge(state) {
 
   const inExtra = !!extra.inUse;
 
-  // The badge shows the MOST-CONSTRAINED limit (session or any weekly), not
-  // always the session — otherwise an exhausted weekly (e.g. Fable at 100%)
-  // hides behind a low session number. This keeps the "never hit a limit by
-  // surprise" promise: the badge number is the one you most need to watch.
+  // The badge escalates on session vs. weekly-ALL-MODELS only — the two
+  // limits that gate ALL Claude usage. It deliberately does NOT escalate on
+  // a scoped per-model bucket (seven_day_fable, seven_day_opus, etc.):
+  // maxing out one model's weekly quota doesn't block you from using Claude
+  // at all, so it shouldn't hijack the top-level number to a scary 100%
+  // while session and weekly-all still have headroom. Per-model exhaustion
+  // is still fully visible in the popup's "By model" rows and in the badge
+  // tooltip below — just not driving the headline percentage.
   let worst = sessionPct;
   let worstSeverity = null;
-  for (const b of state.buckets) {
-    const counts = b.key === "five_hour" || b.key.startsWith("seven_day");
-    if (counts && b.utilization != null && b.utilization > worst) {
-      worst = b.utilization;
-      worstSeverity = b.severity || null;
-    }
+  const weeklyAll = state.buckets.find((b) => b.key === "seven_day");
+  if (weeklyAll?.utilization != null && weeklyAll.utilization > worst) {
+    worst = weeklyAll.utilization;
+    worstSeverity = weeklyAll.severity || null;
   }
 
   const pct = Math.min(999, Math.round(worst));
