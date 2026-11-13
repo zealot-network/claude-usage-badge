@@ -1,322 +1,67 @@
 // background.js — MV3 service worker
 // Single source of truth for usage state; drives the badge.
 //
-// Design: the /usage endpoint keeps gaining new bucket types over time
-// (seven_day_sonnet, seven_day_opus, Claude Design, etc.). Rather than
-// hardcoding a fixed list, we discover any object with shape
-// { utilization, resets_at } and surface it in the popup. That keeps the
-// extension resilient when Anthropic adds another bucket.
+// All parsing lives in lib/core.js (pure, unit-tested). This file is the
+// orchestration: which orgs to poll, when, and how results land in storage.
+//
+// State (see lib/core.js defaultState) is keyed per organization so a login
+// that belongs to several orgs (personal plan + a Team) is tracked side by
+// side instead of one org's data bleeding into another's.
 
-// Set to true to re-enable verbose logging + URL tracking for debugging
-// new endpoints. Off by default in production.
-const DEBUG = false;
+import { CLAUDE_ORIGIN, CONSOLE_ORIGIN, DEBUG } from "./config.js";
+import { FEATURES, isUnlocked } from "./lib/entitlements.js";
+import {
+  defaultState, defaultAccount, defaultConsole, migrateState, displayOrgId,
+  parseUsage, finalizeExtra, applyOverageSpendLimit, detectAutoReload,
+  centsOrMinorToMajor, extractRunBudget, liveRoutineRuns,
+  normalizeTier, pickBestTier, explicitTierFields, summarizeOrgs,
+  parseConsoleCredits, parseConsoleSpend, parseConsoleRateLimits,
+  computeBadge, ShapeError, UUID_RE,
+} from "./lib/core.js";
+
 const dbg = (...args) => { if (DEBUG) console.log("[Claude Usage Badge]", ...args); };
 
-const DEFAULT_STATE = {
-  buckets: [],          // [{ key, label, utilization, resetsAt, inactive }]
-  routineRuns: null,    // { used, limit, resetsAt } | null
-  extraUsage: {
-    enabled: null,      // null = unknown (no data yet), false = off, true = on
-    status: null,       // "on" | "paused" | "off" | null
-    disabledReason: null,
-    inUse: null,
-    overLimit: null,
-    spentUsd: null,
-    limitUsd: null,
-    balanceUsd: null,
-    utilization: null,  // uncapped % (can exceed 100)
-    severity: null,
-    canToggle: null,
-    autoReload: null,   // true/false when detectable, else null (hidden)
-    resetsAt: null,
-  },
-  subscriptionTier: null,
-  tierFetchedAt: null,  // epoch ms of last successful tier detection
-  orgId: null,
-  lastUpdated: null,    // epoch ms of last SUCCESSFUL usage fetch (never set on errors)
-  lastErrorAt: null,    // epoch ms of last failed fetch
-  lastError: null,
-  errorCode: null,      // 'no_org' | 'auth' | 'network' | 'unknown'
-};
-
-// Friendly labels for known bucket keys. Anything not listed here falls
-// back to a humanized version of the key (e.g. "seven_day_foo" → "Seven Day Foo").
-const BUCKET_LABELS = {
-  five_hour: "Session (5h)",
-  seven_day: "Weekly (all models)",
-  seven_day_sonnet: "Weekly Sonnet",
-  seven_day_opus: "Weekly Opus",
-  // Fable (Claude 5 family). Anthropic's per-model weekly buckets follow
-  // the pattern `seven_day_<model>`, so we pre-label both the bare name
-  // and a possible versioned variant; whichever appears in the API wins.
-  seven_day_fable: "Weekly Fable",
-  seven_day_fable_5: "Weekly Fable 5",
-  // Mythos shares Fable's underlying model (Claude 5 family) — pre-label in
-  // case Anthropic exposes it as its own bucket.
-  seven_day_mythos: "Weekly Mythos",
-  seven_day_haiku: "Weekly Haiku",
-  // "omelette" is Claude Design's internal codename on the /usage endpoint.
-  // Easter egg: kept the codename in quotes for fun.
-  seven_day_omelette: "Weekly Claude Design \"omelette\"",
-  seven_day_design: "Weekly Claude Design",
-  seven_day_claude_design: "Weekly Claude Design",
-  claude_design: "Claude Design",
-  // "cowork" is the internal codename for Claude's Scheduled feature.
-  // (Routine runs are a separate Claude Code feature, tracked elsewhere.)
-  seven_day_cowork: "Weekly Scheduled \"cowork\"",
-  seven_day_oauth_apps: "Weekly OAuth apps",
-  omelette_promotional: "Claude Design promo",
-  iguana_necktie: "\"iguana necktie\" (mystery)",
-  daily: "Daily",
-};
-
-// Preferred display order — buckets not listed here sort alphabetically after these.
-const BUCKET_ORDER = [
-  "five_hour",
-  "seven_day",
-  "seven_day_sonnet",
-  "seven_day_opus",
-  "seven_day_fable",
-  "seven_day_fable_5",
-  "seven_day_mythos",
-  "seven_day_haiku",
-  "seven_day_omelette",
-  "seven_day_design",
-  "seven_day_claude_design",
-  "claude_design",
-  "seven_day_cowork",
-  "seven_day_oauth_apps",
-  "omelette_promotional",
-  "iguana_necktie",
-  "daily",
-];
-
-function labelFor(key) {
-  if (BUCKET_LABELS[key]) return BUCKET_LABELS[key];
-  return key
-    .split("_")
-    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
-    .join(" ");
-}
-
-function toEpoch(v) {
-  if (!v) return null;
-  // Numeric timestamps: treat values below 1e12 as epoch-seconds.
-  if (typeof v === "number") {
-    const ms = v < 1e12 ? v * 1000 : v;
-    return Number.isFinite(ms) ? ms : null;
-  }
-  const t = new Date(v).getTime();
-  return Number.isFinite(t) ? t : null;
-}
-
-// A null-valued key in the /usage response is only a real "inactive bucket"
-// if it looks like one. This stops unrelated null fields (e.g. a future
-// "billing_migration": null) from rendering as bogus "Not active" rows.
-function isPlausibleBucketKey(key) {
-  return (
-    Object.prototype.hasOwnProperty.call(BUCKET_LABELS, key) ||
-    /^(five_hour|seven_day|daily)/.test(key)
-  );
-}
-
-// { amount_minor, exponent } → dollars. The /usage `spend` object and its
-// nested caps/balances all use this minor-unit shape.
-function minorToUsd(m) {
-  if (!m || typeof m !== "object" || typeof m.amount_minor !== "number") return null;
-  const exp = typeof m.exponent === "number" ? m.exponent : 2;
-  return m.amount_minor / Math.pow(10, exp);
-}
-
-// Preferred bucket source: the structured `limits` array added in mid-2026.
-// Each entry is { kind, group, percent, severity, resets_at, scope, is_active }.
-// weekly_scoped entries carry scope.model.display_name (e.g. "Fable"), so we
-// get real model names with no codename guessing. We map onto the existing
-// key scheme (five_hour / seven_day / seven_day_<model>) so popup routing and
-// the badge keep working unchanged.
-function bucketsFromLimits(limits) {
-  const out = [];
-  for (const l of limits) {
-    if (!l || typeof l !== "object") continue;
-    const pct = typeof l.percent === "number" ? l.percent : null;
-    let key, label;
-    if (l.kind === "session") {
-      key = "five_hour";
-      label = "Session (5h)";
-    } else if (l.kind === "weekly_all") {
-      key = "seven_day";
-      label = "Weekly (all models)";
-    } else if (l.kind === "weekly_scoped") {
-      const name = l.scope?.model?.display_name || l.scope?.surface;
-      const slug = name
-        ? String(name).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
-        : "scoped";
-      key = "seven_day_" + slug;
-      label = name ? "Weekly " + name : "Weekly (scoped)";
-    } else {
-      // Unknown kind — surface it rather than drop it.
-      key = l.kind || "unknown";
-      label = labelFor(key);
-    }
-    out.push({
-      key,
-      label,
-      utilization: pct,
-      resetsAt: toEpoch(l.resets_at),
-      severity: typeof l.severity === "string" ? l.severity : null,
-      active: l.is_active === true,
-      inactive: false,
-    });
-  }
-  // session first, weekly (all) next, scoped models after — stable otherwise.
-  const rank = (k) => (k === "five_hour" ? 0 : k === "seven_day" ? 1 : 2);
-  out.sort((a, b) => rank(a.key) - rank(b.key));
-  return out;
-}
-
-function extractBuckets(usage) {
-  if (!usage || typeof usage !== "object") return [];
-  const out = [];
-  for (const [key, val] of Object.entries(usage)) {
-    if (key === "extra_usage") continue;
-
-    // Null-valued buckets represent features the user hasn't activated yet.
-    // We still surface them (muted) so the UI shows the full set of limits
-    // the plan exposes — they'll populate with real data on first use.
-    if (val === null) {
-      if (!isPlausibleBucketKey(key)) continue;
-      out.push({
-        key,
-        label: labelFor(key),
-        utilization: null,
-        resetsAt: null,
-        inactive: true,
-      });
-      continue;
-    }
-
-    if (typeof val !== "object") continue;
-    const hasUtil = "utilization" in val;
-    const hasReset = "resets_at" in val;
-    if (!hasUtil && !hasReset) continue;
-    out.push({
-      key,
-      label: labelFor(key),
-      utilization: typeof val.utilization === "number" ? val.utilization : null,
-      resetsAt: toEpoch(val.resets_at),
-      inactive: false,
-    });
-  }
-  out.sort((a, b) => {
-    const ai = BUCKET_ORDER.indexOf(a.key);
-    const bi = BUCKET_ORDER.indexOf(b.key);
-    if (ai !== -1 && bi !== -1) return ai - bi;
-    if (ai !== -1) return -1;
-    if (bi !== -1) return 1;
-    return a.key.localeCompare(b.key);
-  });
-  return out;
-}
-
-// ─── Badge rendering ────────────────────────────────────────────────────────
-
-// Badge palette: deeper tones than the popup's (--green #22c55e etc.) on
-// purpose — the badge text is forced white via setBadgeTextColor, and white
-// needs a darker background to stay readable at ~9px on both light and dark
-// toolbars. Same hue family as the popup, so the traffic-light meaning holds.
-const COLOR_GREEN = "#15803D";
-const COLOR_AMBER = "#B45309";
-const COLOR_RED = "#B91C1C";
-const COLOR_GREY = "#52525B";
 const BADGE_TEXT = "#FFFFFF";
+const MAX_TRACKED_ORGS = 4;
+const ORGS_TTL_MS = 6 * 60 * 60_000;          // re-list organizations every 6h
+const SECONDARY_INTERVAL_MS = 12 * 60_000;    // orgs that aren't on the badge
+const CONSOLE_INTERVAL_MS = 5 * 60_000;
+const TIER_HIT_TTL_MS = 12 * 60 * 60_000;
+const TIER_MISS_TTL_MS = 60 * 60_000;
+const PROBE_COOLDOWN_MS = 30 * 60_000;        // speculative endpoints that 404
+const ORGS_RETRY_MS = 30 * 60_000;            // floor between org-list attempts
+const MIN_CYCLE_GAP_MS = 20_000;              // global floor between non-forced cycles
+const FULL_CYCLE_GAP_MS = 150_000;            // pokes in between only re-read /usage
 
-function computeBadge(state) {
-  const session = state.buckets.find((b) => b.key === "five_hour");
-  const sessionPct = session?.utilization ?? null;
-  const extra = state.extraUsage || {};
+// ─── State (serialized writes) ──────────────────────────────────────────────
+// chrome.storage read-modify-write is not atomic. Every writer in this worker
+// funnels through one promise chain so a slow writer can't clobber a fast one.
 
-  if (sessionPct == null) {
-    // No data. If we have an error, surface it on the badge instead of
-    // silently showing nothing.
-    if (state.lastError) {
-      return {
-        text: "!",
-        color: COLOR_GREY,
-        title: `Claude Usage Badge — ${state.lastError}`,
-      };
-    }
-    return { text: "", color: COLOR_GREY, title: "Claude Usage Badge — no data yet" };
-  }
-
-  const inExtra = !!extra.inUse;
-
-  // The badge escalates on session vs. weekly-ALL-MODELS only — the two
-  // limits that gate ALL Claude usage. It deliberately does NOT escalate on
-  // a scoped per-model bucket (seven_day_fable, seven_day_opus, etc.):
-  // maxing out one model's weekly quota doesn't block you from using Claude
-  // at all, so it shouldn't hijack the top-level number to a scary 100%
-  // while session and weekly-all still have headroom. Per-model exhaustion
-  // is still fully visible in the popup's "By model" rows and in the badge
-  // tooltip below — just not driving the headline percentage.
-  let worst = sessionPct;
-  let worstSeverity = null;
-  const weeklyAll = state.buckets.find((b) => b.key === "seven_day");
-  if (weeklyAll?.utilization != null && weeklyAll.utilization > worst) {
-    worst = weeklyAll.utilization;
-    worstSeverity = weeklyAll.severity || null;
-  }
-
-  const pct = Math.min(999, Math.round(worst));
-  const text = `${pct}%`;
-
-  // Prefer the API's own severity for the worst limit; fall back to % bands.
-  let color;
-  if (inExtra || extra.overLimit) color = COLOR_RED;
-  else if (worstSeverity === "critical") color = COLOR_RED;
-  else if (worstSeverity === "warning")  color = COLOR_AMBER;
-  else if (worstSeverity === "normal")   color = COLOR_GREEN;
-  else if (worst >= 90) color = COLOR_RED;
-  else if (worst >= 70) color = COLOR_AMBER;
-  else                  color = COLOR_GREEN;
-
-  const parts = [`Session: ${Math.round(sessionPct)}%`];
-  for (const b of state.buckets) {
-    if (b.key === "five_hour" || b.utilization == null) continue;
-    parts.push(`${b.label}: ${Math.round(b.utilization)}%`);
-  }
-  if (extra.status === "on" || extra.status === "paused") {
-    const label =
-      extra.status === "paused"
-        ? (extra.overLimit ? "Credits: OVER LIMIT" : "Credits: PAUSED")
-        : (inExtra ? "Credits: IN USE" : "Credits: ON");
-    parts.push(label);
-    if (extra.spentUsd != null && extra.limitUsd) {
-      const upct = extra.utilization != null ? ` (${Math.round(extra.utilization)}%)` : "";
-      parts.push(`$${extra.spentUsd.toFixed(2)} / $${extra.limitUsd.toFixed(2)}${upct}`);
-    } else if (extra.spentUsd != null) {
-      parts.push(`~$${extra.spentUsd.toFixed(2)} spent`);
-    }
-  }
-  if (session?.resetsAt) {
-    const mins = Math.max(0, Math.round((session.resetsAt - Date.now()) / 60000));
-    if (mins > 0) parts.push(`Resets in ${mins}m`);
-  }
-  if (state.lastError) {
-    parts.push(`Last refresh failed: ${state.lastError}`);
-  }
-
-  return { text, color, title: parts.join(" · ") };
+async function readState() {
+  const { usageState } = await chrome.storage.local.get("usageState");
+  return migrateState(usageState);
 }
 
-async function refreshBadge() {
-  const { usageState } = await chrome.storage.local.get("usageState");
-  const state = usageState || DEFAULT_STATE;
-  const { text, color, title } = computeBadge(state);
+let writeQueue = Promise.resolve();
+
+function updateState(mutator) {
+  writeQueue = writeQueue
+    .then(async () => {
+      const prev = await readState();
+      const next = mutator(prev) || prev;
+      await chrome.storage.local.set({ usageState: next });
+      await renderBadge(next);
+    })
+    .catch((e) => dbg("updateState error:", e));
+  return writeQueue;
+}
+
+async function renderBadge(state) {
+  const { text, color, title } = computeBadge(state, Date.now());
   await chrome.action.setBadgeText({ text });
   await chrome.action.setBadgeBackgroundColor({ color });
   try {
-    // Chrome 110+; without this Chrome auto-picks black on our greens,
-    // which is barely readable at badge size.
+    // Chrome 110+; without this Chrome auto-picks black on our greens.
     await chrome.action.setBadgeTextColor({ color: BADGE_TEXT });
   } catch {
     // Very old Chrome — auto text color is the graceful fallback.
@@ -324,43 +69,11 @@ async function refreshBadge() {
   await chrome.action.setTitle({ title });
 }
 
-// ─── State writes (serialized) ──────────────────────────────────────────────
-// chrome.storage read-modify-write is not atomic. All writers in this worker
-// (alarm fetch, popup refresh, sniffed payloads) funnel through one promise
-// chain so a slow writer can't clobber a fast one with a stale snapshot.
-
-let writeQueue = Promise.resolve();
-
-function mergeState(partial) {
-  writeQueue = writeQueue
-    .then(async () => {
-      const { usageState } = await chrome.storage.local.get("usageState");
-      const prev = usageState || DEFAULT_STATE;
-      const next = { ...prev, ...partial };
-      await chrome.storage.local.set({ usageState: next });
-      await refreshBadge();
-    })
-    .catch((e) => dbg("mergeState error:", e));
-  return writeQueue;
+async function refreshBadge() {
+  await renderBadge(await readState());
 }
 
 // ─── API layer ──────────────────────────────────────────────────────────────
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-async function getOrgId() {
-  try {
-    const cookie = await chrome.cookies.get({
-      name: "lastActiveOrg",
-      url: "https://claude.ai",
-    });
-    const val = cookie?.value || null;
-    // The org id is interpolated into URL paths — only accept a real UUID.
-    return val && UUID_RE.test(val) ? val : null;
-  } catch {
-    return null;
-  }
-}
 
 class ApiError extends Error {
   constructor(status, endpoint) {
@@ -371,38 +84,81 @@ class ApiError extends Error {
   }
 }
 
-async function apiFetch(endpoint) {
-  const resp = await fetch(`https://claude.ai/api${endpoint}`, {
-    method: "GET",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-  });
-  if (!resp.ok) throw new ApiError(resp.status, endpoint);
+class NetworkError extends Error {
+  constructor(endpoint) {
+    super(`Network error: ${endpoint}`);
+    this.name = "NetworkError";
+  }
+}
+
+// Set when ANY claude.ai request in the current cycle is answered 429, so the
+// whole extension backs off — not only when /usage itself is throttled.
+let saw429 = false;
+
+async function originFetch(origin, path, headers = {}) {
+  let resp;
+  try {
+    resp = await fetch(`${origin}${path}`, {
+      method: "GET",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...headers },
+    });
+  } catch {
+    // Only fetch()'s own rejection is a network failure.
+    throw new NetworkError(path);
+  }
+  if (resp.status === 429 && origin === CLAUDE_ORIGIN) saw429 = true;
+  if (!resp.ok) throw new ApiError(resp.status, path);
   try {
     return await resp.json();
   } catch {
-    // 200 that isn't JSON (Cloudflare challenge, login redirect HTML, etc.)
-    throw new ApiError(0, endpoint);
+    // 200 that isn't JSON (Cloudflare challenge, login redirect HTML, …)
+    throw new ApiError(0, path);
   }
 }
 
-// Try a list of candidate endpoints and return the first successful JSON body.
-async function tryEndpoints(endpoints) {
-  for (const ep of endpoints) {
-    try {
-      return { ok: true, data: await apiFetch(ep), endpoint: ep };
-    } catch {
-      // try next
-    }
+const claudeApi = (endpoint, headers) => originFetch(CLAUDE_ORIGIN, `/api${endpoint}`, headers);
+const consoleApi = (endpoint) => originFetch(CONSOLE_ORIGIN, `/api${endpoint}`);
+
+async function getCookieOrg(origin) {
+  try {
+    const cookie = await chrome.cookies.get({ name: "lastActiveOrg", url: origin });
+    const val = cookie?.value || null;
+    // The org id is interpolated into URL paths — only accept a real UUID.
+    return val && UUID_RE.test(val) ? val : null;
+  } catch {
+    return null;
   }
-  return { ok: false };
+}
+
+function describeError(err, host) {
+  if (err instanceof ApiError) {
+    if (err.status === 401 || err.status === 403) {
+      return { errorCode: "auth", lastError: `${host} session expired or unauthorized.` };
+    }
+    if (err.status === 404) {
+      return { errorCode: "unknown", lastError: `${host} usage API not found — the API may have changed.` };
+    }
+    if (err.status === 429) {
+      return { errorCode: "rate_limited", lastError: `Rate limited by ${host} — backing off.` };
+    }
+    if (err.status === 0) {
+      return { errorCode: "unknown", lastError: `Unexpected non-JSON response from ${host}.` };
+    }
+    return { errorCode: "network", lastError: `${host} returned an error (${err.status}).` };
+  }
+  if (err instanceof NetworkError) {
+    return { errorCode: "network", lastError: `Network error reaching ${host}.` };
+  }
+  if (err instanceof ShapeError) {
+    return { errorCode: "shape", lastError: `${host} returned usage data in a new format — an extension update may be needed.` };
+  }
+  return { errorCode: "unknown", lastError: err?.message || "Failed to fetch usage" };
 }
 
 // ─── Throttle state (persisted) ─────────────────────────────────────────────
-// MV3 kills the service worker after ~30s idle, so module-level timers reset
-// between the 3-minute alarm cycles. Throttle timestamps live in
-// chrome.storage.session (in-memory, cleared when the browser closes) so the
-// 429 backoff and probe cooldown actually survive worker restarts.
+// MV3 kills the service worker after ~30s idle, so module-level timers reset.
+// Throttle timestamps live in chrome.storage.session so they survive restarts.
 
 async function getThrottle() {
   try {
@@ -422,130 +178,38 @@ async function patchThrottle(partial) {
   }
 }
 
-// ─── Scheduled / routine-run budget ─────────────────────────────────────────
+// ─── Per-org fetch ──────────────────────────────────────────────────────────
 
-// Don't hammer speculative endpoints that 404: after a full miss, skip
-// re-probing for 30 minutes. The sniffer path (handleSniffedPayload) is the
-// primary source anyway.
-const ROUTINE_PROBE_COOLDOWN_MS = 30 * 60_000;
+// Per-org jitter (0–15 min, stable per org) so several orgs' cooldowns don't
+// all expire into the same cycle.
+const jitter = (orgId) => (parseInt(orgId.slice(0, 2), 16) % 16) * 60_000;
+const cooled = (probes, name, now, orgId = "00") =>
+  now - (probes[name] || 0) < PROBE_COOLDOWN_MS + jitter(orgId);
+const definitiveMiss = (err) => err instanceof ApiError && (err.status === 404 || err.status === 403 || err.status === 401);
 
-async function fetchRoutineRuns(orgId) {
-  const { routineProbeMissedAt = 0 } = await getThrottle();
-  if (Date.now() - routineProbeMissedAt < ROUTINE_PROBE_COOLDOWN_MS) return null;
-
-  // Cowork is Claude's codename for the Scheduled feature. The settings page
-  // fetches /cowork_settings; that's the most likely home for a run budget.
+async function fetchRoutineRuns(orgId, probes, now) {
+  if (cooled(probes, "routines", now, orgId)) return null;
   const candidates = [
-    `/organizations/${orgId}/cowork_settings`,
-    `/organizations/${orgId}/routines/run-budget`,
+    () => claudeApi(`/organizations/${orgId}/routines/run-budget`),
+    () => originFetch(CLAUDE_ORIGIN, "/v1/code/routines/run-budget", { "x-organization-uuid": orgId }),
   ];
-  const { ok, data, endpoint } = await tryEndpoints(candidates);
-  if (!ok || !data) {
-    await patchThrottle({ routineProbeMissedAt: Date.now() });
-    return null;
+  for (const attempt of candidates) {
+    try {
+      const budget = extractRunBudget(await attempt(), { allowGeneric: true });
+      if (budget) return { ...budget, seenAt: now };
+    } catch {
+      // try next
+    }
   }
-
-  dbg("cowork/routines response from", endpoint, data);
-
-  // Direct fields first — require BOTH a used and a limit, both numeric.
-  const directUsed =
-    data.runs_used ?? data.used_runs ?? data.daily_runs_used ?? data.routines_used ??
-    data.used ?? data.consumed ?? null;
-  const directLimit =
-    data.runs_limit ?? data.daily_runs_limit ?? data.routines_limit ??
-    data.run_budget ?? data.daily_limit ?? data.limit ?? data.budget ?? null;
-  const directReset = toEpoch(
-    data.resets_at ?? data.reset_at ?? data.next_reset ?? data.next_reset_at
-  );
-
-  if (typeof directUsed === "number" && typeof directLimit === "number") {
-    return { used: directUsed, limit: directLimit, resetsAt: directReset };
-  }
-
-  // Heuristic walk for nested shapes.
-  return extractRunBudget(data);
-}
-
-// ─── Tier detection ─────────────────────────────────────────────────────────
-
-// Token-based tier matching. Substring matching produced false positives
-// ("pro" in "product_tour_seen", "max" in "claude_max_disabled"), so we
-// split into tokens and require exact token membership, plus negative
-// tokens that disqualify flag-style strings.
-const TIER_NEGATIVE_TOKENS = new Set([
-  "disabled", "ineligible", "upsell", "banner", "seen", "dismissed",
-  "eligible", "promo", "trial", "ended", "expired",
-]);
-
-function normalizeTier(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  const tokens = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  const has = (t) => tokens.includes(t);
-  for (const t of tokens) if (TIER_NEGATIVE_TOKENS.has(t)) return null;
-
-  if (has("max") && (has("20x") || has("20") || has("twenty"))) return "max_20x";
-  if (has("max") && (has("5x") || has("5") || has("five"))) return "max_5x";
-  if (has("max")) return "max_5x";
-  if (has("enterprise")) return "enterprise";
-  if (has("team") || has("raven")) return "team";
-  if (has("pro")) return "pro";
-  if (has("free")) return "free";
+  probes.routines = now;
   return null;
 }
 
-const TIER_RANK = {
-  max_20x: 6,
-  max_5x: 5,
-  enterprise: 4,
-  team: 3,
-  pro: 2,
-  free: 1,
-};
-
-function pickBestTier(tiers) {
-  let best = null;
-  for (const t of tiers) {
-    if (!t) continue;
-    if (!best || TIER_RANK[t] > TIER_RANK[best]) best = t;
-  }
-  return best;
-}
-
-// Only read values of keys that explicitly name a plan/tier — walking every
-// "capability"-ish key rank-maxed experiment flags into wrong tiers.
-const TIER_FIELD_NAMES = [
-  "tier", "plan", "plan_name", "plan_type", "subscription_tier",
-  "product_name", "rate_limit_tier", "billing_type", "name",
-];
-
-function explicitTierFields(obj) {
-  const out = [];
-  if (!obj || typeof obj !== "object") return out;
-  for (const k of TIER_FIELD_NAMES) {
-    const v = obj[k];
-    if (typeof v === "string") out.push(v);
-  }
-  // One nested level for common wrappers like { subscription: { tier } }.
-  for (const wrap of ["subscription", "billing", "plan"]) {
-    const inner = obj[wrap];
-    if (inner && typeof inner === "object") {
-      for (const k of TIER_FIELD_NAMES) {
-        const v = inner[k];
-        if (typeof v === "string") out.push(v);
-      }
-    }
-  }
-  return out;
-}
-
-// Sources are tried in order of authority. The first source that yields a
-// tier wins — we do NOT rank-max across sources, so a stray "max"-flavored
-// string in a weaker source can't override subscription_details.
-async function fetchTier(orgId) {
-  // 1. subscription_details — the billing system's own answer.
+// Fallback tier detection for orgs whose /organizations record didn't say.
+// Sources are tried in order of authority; the first that yields a tier wins.
+async function fetchTierFallback(orgId) {
   try {
-    const sub = await apiFetch(`/organizations/${orgId}/subscription_details`);
-    dbg("subscription_details:", sub);
+    const sub = await claudeApi(`/organizations/${orgId}/subscription_details`);
     const candidates = explicitTierFields(sub);
     const m = Number(sub?.max_multiplier);
     if (m === 20) candidates.push("max_20x");
@@ -555,400 +219,531 @@ async function fetchTier(orgId) {
   } catch {
     // fall through
   }
-
-  // 2. Organization record.
   try {
-    const org = await apiFetch(`/organizations/${orgId}`);
-    const candidates = explicitTierFields(org);
-    if (Array.isArray(org?.capabilities)) {
-      for (const cap of org.capabilities) {
-        if (typeof cap === "string") candidates.push(cap);
-      }
-    }
-    const tier = pickBestTier(candidates.map(normalizeTier));
-    if (tier) return tier;
-  } catch {
-    // fall through
-  }
-
-  // 3. Bootstrap growthbook flags (older, still reliable booleans).
-  try {
-    const bootstrap = await apiFetch(
+    const bootstrap = await claudeApi(
       `/bootstrap/${orgId}/app_start?statsig_hashing_algorithm=djb2`
     );
     const user = bootstrap?.org_growthbook?.user;
     if (user) {
-      if (user.isMax) return user.maxTier === "20x" ? "max_20x" : "max_5x";
       if (user.isRaven) return "team";
       if (user.isEnterprise) return "enterprise";
+      if (user.isMax) return user.maxTier === "20x" ? "max_20x" : "max_5x";
       if (user.isPro) return "pro";
       if (user.isFree) return "free";
     }
-    const tier = pickBestTier(explicitTierFields(bootstrap?.account).map(normalizeTier));
-    if (tier) return tier;
   } catch {
     // fall through
   }
   return null;
 }
 
-// ─── Main fetch cycle ───────────────────────────────────────────────────────
+// Returns the next Account record for this org. Never throws.
+async function fetchAccount(org, prevAccount, now, flags) {
+  const prev = prevAccount || defaultAccount(org.id);
+  const base = { ...prev, orgId: org.id, name: org.name ?? prev.name, kind: org.kind ?? prev.kind };
+  const probes = { ...(prev.probes || {}) };
 
-const TIER_TTL_MS = 12 * 60 * 60_000; // re-detect tier every 12h
-let inFlight = null;                   // dedupe concurrent fetch cycles (per worker)
+  let parsed;
+  try {
+    parsed = parseUsage(await claudeApi(`/organizations/${org.id}/usage`));
+  } catch (err) {
+    if (!(err instanceof ApiError) && !(err instanceof NetworkError) && !(err instanceof ShapeError)) {
+      console.error("[Claude Usage Badge] fetch error:", err);
+    }
+    const d = describeError(err, "Claude");
+    const out = { ...base, ...d, lastErrorAt: now };
+    // An org we're not allowed to read must not keep showing old numbers.
+    if (d.errorCode === "auth") {
+      out.lastError = "No access to this organization's usage.";
+      out.buckets = [];
+      out.extraUsage = defaultAccount().extraUsage;
+      out.routineRuns = null;
+      out.lastUpdated = null;
+    }
+    return out;
+  }
 
-function fetchUsageAndUpdate(force = false) {
-  if (inFlight) return inFlight;
-  inFlight = doFetchUsage(force).finally(() => { inFlight = null; });
+  const { buckets } = parsed;
+  let extra = parsed.extraUsage;
+  const prevExtra = prev.extraUsage || {};
+  const light = !!flags.light;   // poke-triggered: /usage only, reuse the rest
+  const creditsLive = extra.status === "on" || extra.status === "paused";
+
+  // Values /usage doesn't carry are reused from the last full cycle unless
+  // re-fetched below.
+  const carryBalance = () => {
+    if (!creditsLive) return;
+    if (extra.balanceUsd == null) extra.balanceUsd = prevExtra.balanceUsd ?? null;
+    if (extra.autoReload == null) extra.autoReload = prevExtra.autoReload ?? null;
+  };
+  const carryMemberLimit = () => {
+    if (prevExtra.scope && prevExtra.limitUsd != null && extra.limitUsd == null) {
+      extra = finalizeExtra(
+        { ...extra, enabled: prevExtra.enabled, limitUsd: prevExtra.limitUsd,
+          spentUsd: prevExtra.spentUsd, currency: prevExtra.currency, scope: prevExtra.scope },
+        buckets
+      );
+    }
+  };
+
+  // Prepaid balance + auto-reload aren't always in /usage.
+  const needCredits = creditsLive && (extra.balanceUsd == null || extra.autoReload == null);
+  if (needCredits && !light && (flags.force || !cooled(probes, "credits", now, org.id))) {
+    try {
+      const credits = await claudeApi(`/organizations/${org.id}/prepaid/credits`);
+      if (extra.balanceUsd == null) extra.balanceUsd = centsOrMinorToMajor(credits?.amount);
+      if (extra.autoReload == null) extra.autoReload = detectAutoReload(credits);
+    } catch (err) {
+      // Members of a Team org are typically not allowed to read this — don't
+      // ask again every cycle.
+      if (definitiveMiss(err)) probes.credits = now;
+      else carryBalance();
+    }
+  } else {
+    carryBalance();
+  }
+
+  // Team / Enterprise seats: the member's own spend cap lives elsewhere.
+  const isSeat = base.kind === "team" || base.kind === "enterprise";
+  if (isSeat && flags.team && extra.limitUsd == null) {
+    if (!light && (flags.force || !cooled(probes, "overage", now, org.id))) {
+      try {
+        const body = await claudeApi(`/organizations/${org.id}/overage_spend_limit`);
+        extra = applyOverageSpendLimit(extra, body, buckets);
+        // No positive cap came back (unusable answer, or credits are off for
+        // the org) — that won't change minute to minute, so don't re-ask
+        // every cycle.
+        if (extra.limitUsd == null) probes.overage = now;
+      } catch (err) {
+        // Only a definitive "not there / not allowed" starts the cooldown; a
+        // blip keeps the last known cap instead of hiding it.
+        if (definitiveMiss(err)) probes.overage = now;
+        else carryMemberLimit();
+      }
+    } else {
+      // Not asked this cycle (poke, or cooling down): keep what we knew.
+      carryMemberLimit();
+      if (extra.limitUsd == null && prevExtra.scope) {
+        extra = finalizeExtra(
+          { ...extra, scope: prevExtra.scope, disabledReason: extra.disabledReason || prevExtra.disabledReason },
+          buckets
+        );
+      }
+    }
+  }
+
+  // Tier: an explicit answer in the org list is free; otherwise ask
+  // subscription_details (cached), and only then fall back to a guess.
+  let tier = org.tier || null;
+  let tierCheckedAt = prev.tierCheckedAt;
+  if (!tier) {
+    const ttl = prev.subscriptionTier ? TIER_HIT_TTL_MS : TIER_MISS_TTL_MS;
+    let probed = null;
+    if (!light && (!prev.tierCheckedAt || now - prev.tierCheckedAt > ttl)) {
+      probed = await fetchTierFallback(org.id);
+      tierCheckedAt = now;       // recorded on a miss too — no per-cycle re-probing
+    }
+    tier = probed || prev.subscriptionTier || org.tierGuess || null;
+  }
+
+  const fresh = light ? null : await fetchRoutineRuns(org.id, probes, now);
+  const routineRuns = liveRoutineRuns(fresh || prev.routineRuns, now);
+
+  return {
+    ...base,
+    buckets,
+    extraUsage: finalizeExtra(extra, buckets),
+    routineRuns,
+    subscriptionTier: tier,
+    tierCheckedAt,
+    probes,
+    lastUpdated: now,
+    lastError: null,
+    errorCode: null,
+  };
+}
+
+// ─── API Console ────────────────────────────────────────────────────────────
+
+async function consolePermitted() {
+  try {
+    return await chrome.permissions.contains({ origins: [`${CONSOLE_ORIGIN}/*`] });
+  } catch {
+    return false;
+  }
+}
+
+async function fetchConsole(prev, now) {
+  const base = { ...defaultConsole(), ...prev, enabled: true };
+  const fail = (lastError, errorCode) => ({ ...base, lastError, errorCode, lastErrorAt: now });
+
+  if (!(await consolePermitted())) {
+    return fail("Permission for platform.claude.com was removed.", "permission");
+  }
+
+  let orgId = await getCookieOrg(CONSOLE_ORIGIN);
+  let orgName = base.orgId === orgId ? base.orgName : null;
+  try {
+    if (!orgId || !orgName) {
+      const list = await consoleApi("/organizations");
+      // The Console lists every org on the login, chat plans included, and
+      // answers 403 for those — only API organizations have Console billing.
+      const orgs = (Array.isArray(list) ? list : []).filter(
+        (o) => o && UUID_RE.test(o.uuid || o.id || "") &&
+          (!Array.isArray(o.capabilities) || o.capabilities.includes("api"))
+      );
+      const match = orgs.find((o) => (o.uuid || o.id) === orgId) || orgs[0];
+      if (match) {
+        orgId = match.uuid || match.id;
+        orgName = typeof match.name === "string" ? match.name : null;
+      }
+    }
+  } catch (err) {
+    if (!orgId) {
+      const d = describeError(err, "The API Console");
+      return fail(d.errorCode === "auth" ? "Sign in to the API Console." : d.lastError, d.errorCode);
+    }
+  }
+  if (!orgId) return fail("Sign in to the API Console.", "auth");
+
+  const settle = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+  const [credits, spend, limits] = await Promise.all([
+    settle(consoleApi(`/organizations/${orgId}/prepaid/credits`)),
+    settle(consoleApi(`/organizations/${orgId}/current_spend`)),
+    settle(consoleApi(`/organizations/${orgId}/rate_limits`)),
+  ]);
+
+  if (!credits.ok && !spend.ok) {
+    const d = describeError(credits.e, "The API Console");
+    return {
+      ...fail(d.errorCode === "auth" ? "Sign in to the API Console." : d.lastError, d.errorCode),
+      orgId, orgName,
+    };
+  }
+
+  const c = credits.ok ? parseConsoleCredits(credits.v) : {};
+  const s = spend.ok ? parseConsoleSpend(spend.v) : {};
+  const r = limits.ok ? parseConsoleRateLimits(limits.v) : {};
+  const parsedAny = c.balanceUsd != null || s.spendUsd != null;
+  return {
+    ...defaultConsole(),
+    enabled: true,
+    orgId,
+    orgName,
+    balanceUsd: c.balanceUsd ?? null,
+    autoReload: c.autoReload ?? null,
+    currency: c.currency || "USD",
+    spendUsd: s.spendUsd ?? null,
+    spendLimitUsd: s.spendLimitUsd ?? r.spendLimitUsd ?? null,
+    resetsAt: s.resetsAt ?? null,
+    expiresAt: c.expiresAt ?? null,
+    tier: r.tier ?? null,
+    lastUpdated: parsedAny ? now : base.lastUpdated,
+    lastError: parsedAny ? null : "The API Console returned data in a format this version doesn't understand.",
+    errorCode: parsedAny ? null : "shape",
+    lastErrorAt: parsedAny ? null : now,
+  };
+}
+
+async function consoleCycle(force) {
+  const state = await readState();
+  if (!state.console?.enabled) return;
+  if (!(await isUnlocked(FEATURES.CONSOLE))) return;
+  const now = Date.now();
+  const last = Math.max(state.console.lastUpdated || 0, state.console.lastErrorAt || 0);
+  if (!force && now - last < CONSOLE_INTERVAL_MS) return;
+  const next = await fetchConsole(state.console, now);
+  // Respect a disable that happened while we were fetching.
+  await updateState((s) => (s.console?.enabled ? { ...s, console: next } : s));
+}
+
+// ─── Main cycle ─────────────────────────────────────────────────────────────
+
+let inFlight = null;   // dedupe concurrent cycles (per worker)
+let queuedForce = false;
+
+function runCycle(force = false, full = force) {
+  if (inFlight) {
+    // A forced refresh that arrives mid-cycle must not be swallowed by a
+    // non-forced one — run again once the current cycle ends.
+    if (force) queuedForce = true;
+    return inFlight;
+  }
+  inFlight = (async () => {
+    await doCycle(force, full);
+    while (queuedForce) {
+      queuedForce = false;
+      await doCycle(true);
+    }
+  })().finally(() => { inFlight = null; });
   return inFlight;
 }
 
-async function doFetchUsage(force = false) {
-  if (!force) {
-    const { backoffUntil = 0 } = await getThrottle();
-    if (Date.now() < backoffUntil) return;
+async function doCycle(force, full = force) {
+  try {
+    await claudeCycle(force, full);
+  } catch (e) {
+    console.error("[Claude Usage Badge] cycle error:", e);
   }
   try {
-    const orgId = await getOrgId();
-    if (!orgId) {
-      await mergeState({
-        lastError: "Not signed in to Claude.",
-        errorCode: "no_org",
-        lastErrorAt: Date.now(),
-      });
-      return;
-    }
-
-    const usage = await apiFetch(`/organizations/${orgId}/usage`);
-
-    // Prefer the structured `limits` array (real model names + severity).
-    // Fall back to legacy top-level bucket keys for older payload shapes.
-    const buckets =
-      Array.isArray(usage.limits) && usage.limits.length
-        ? bucketsFromLimits(usage.limits)
-        : extractBuckets(usage);
-
-    // ── Usage credits (formerly "extra usage") ──────────────────────────────
-    // The `spend` object is the authoritative source; `extra_usage` is the
-    // legacy fallback. spend gives us used/limit as minor units, a real
-    // enabled flag, disabled_reason, and severity.
-    const spend = usage.spend && typeof usage.spend === "object" ? usage.spend : null;
-    const exLegacy = usage.extra_usage || usage.usage_credits || {};
-
-    let extraEnabled, extraSpentUsd, extraLimitUsd, creditsPercentRaw,
-        disabledReason, extraSeverity, canToggle, autoReloadRaw,
-        balanceRaw, extraResetsAt;
-
-    if (spend) {
-      extraSpentUsd = minorToUsd(spend.used);
-      extraLimitUsd =
-        minorToUsd(spend.limit) ??
-        minorToUsd(spend.cap?.credits) ??
-        minorToUsd(spend.cap?.money);
-      extraEnabled = typeof spend.enabled === "boolean" ? spend.enabled : null;
-      disabledReason = typeof spend.disabled_reason === "string" ? spend.disabled_reason : null;
-      creditsPercentRaw = typeof spend.percent === "number" ? spend.percent : null;
-      extraSeverity = typeof spend.severity === "string" ? spend.severity : null;
-      canToggle = spend.can_toggle === true;
-      autoReloadRaw = typeof spend.auto_reload === "boolean" ? spend.auto_reload : null;
-      balanceRaw = minorToUsd(spend.balance);
-      extraResetsAt = toEpoch(spend.resets_at ?? spend.reset_at);
-    } else {
-      extraEnabled = typeof exLegacy.is_enabled === "boolean" ? exLegacy.is_enabled : null;
-      extraSpentUsd = exLegacy.used_credits != null ? exLegacy.used_credits / 100 : null;
-      extraLimitUsd = exLegacy.monthly_limit != null ? exLegacy.monthly_limit / 100 : null;
-      creditsPercentRaw = typeof exLegacy.utilization === "number" ? exLegacy.utilization : null;
-      disabledReason = typeof exLegacy.disabled_reason === "string" ? exLegacy.disabled_reason : null;
-      extraSeverity = null;
-      canToggle = null;
-      autoReloadRaw = null;
-      balanceRaw = null;
-      extraResetsAt = toEpoch(exLegacy.resets_at ?? exLegacy.monthly_reset_at);
-    }
-
-    // TRUE utilization (uncapped) so 107%-over-limit shows honestly; the API
-    // caps percent at 100.
-    const extraUtilization =
-      extraSpentUsd != null && extraLimitUsd > 0
-        ? (extraSpentUsd / extraLimitUsd) * 100
-        : creditsPercentRaw;
-    const extraOverLimit =
-      extraSpentUsd != null && extraLimitUsd != null && extraSpentUsd > extraLimitUsd;
-
-    // Three-state status: on / paused (disabled with a reason, e.g. over the
-    // cap) / off (user-disabled, no reason) / null (unknown).
-    let creditsStatus;
-    if (extraEnabled === true) creditsStatus = "on";
-    else if (extraEnabled === false && disabledReason) creditsStatus = "paused";
-    else if (extraEnabled === false) creditsStatus = "off";
-    else creditsStatus = null;
-
-    // "IN USE" = credits on AND a limit is currently exhausted (actively
-    // drawing). Paused/over-limit is a separate, louder state.
-    const anyExhausted = buckets.some(
-      (b) => b.utilization != null && b.utilization >= 100
-    );
-    const extraInUse = extraEnabled === true && anyExhausted;
-
-    // Balance + auto-reload aren't always in /usage (both null above for this
-    // user) — pull from prepaid/credits when credits are relevant (on OR
-    // paused: a paused-over-limit user still has a prepaid balance worth
-    // showing).
-    const detectAutoReload = (o) => {
-      if (!o || typeof o !== "object") return null;
-      const candidates = [
-        o.auto_reload, o.auto_reload_enabled, o.is_auto_reload_enabled,
-        o.auto_reload?.enabled, o.auto_reload?.is_enabled,
-        o.auto_reload_settings?.enabled,
-      ];
-      for (const c of candidates) if (typeof c === "boolean") return c;
-      return null;
-    };
-
-    let extraBalanceUsd = balanceRaw;
-    let extraAutoReload = autoReloadRaw;
-    if (creditsStatus === "on" || creditsStatus === "paused") {
-      try {
-        const credits = await apiFetch(`/organizations/${orgId}/prepaid/credits`);
-        if (extraBalanceUsd == null) {
-          extraBalanceUsd = credits.amount != null ? credits.amount / 100 : null;
-        }
-        if (extraAutoReload == null) extraAutoReload = detectAutoReload(credits);
-      } catch {
-        // Non-fatal
-      }
-    }
-
-    // Tier is stable — only re-detect when missing or stale. Saves 1-3
-    // requests per cycle.
-    const { usageState: prevState } = await chrome.storage.local.get("usageState");
-    const prev = prevState || DEFAULT_STATE;
-    const tierStale =
-      !prev.subscriptionTier ||
-      !prev.tierFetchedAt ||
-      Date.now() - prev.tierFetchedAt > TIER_TTL_MS;
-
-    const [tier, routineRuns] = await Promise.all([
-      tierStale ? fetchTier(orgId) : Promise.resolve(null),
-      fetchRoutineRuns(orgId),
-    ]);
-
-    const partial = {
-      buckets,
-      extraUsage: {
-        enabled: extraEnabled,
-        status: creditsStatus,          // "on" | "paused" | "off" | null
-        disabledReason,
-        inUse: extraInUse,
-        overLimit: extraOverLimit,
-        spentUsd: extraSpentUsd,
-        limitUsd: extraLimitUsd,
-        balanceUsd: extraBalanceUsd,
-        utilization: extraUtilization,  // uncapped (can exceed 100)
-        severity: extraSeverity,
-        canToggle,
-        autoReload: extraAutoReload,
-        resetsAt: extraResetsAt,
-      },
-      orgId,
-      lastUpdated: Date.now(),
-      lastError: null,
-      errorCode: null,
-    };
-    // Never clobber known-good values with nulls from a failed probe.
-    if (tier) {
-      partial.subscriptionTier = tier;
-      partial.tierFetchedAt = Date.now();
-    }
-    if (routineRuns != null) partial.routineRuns = routineRuns;
-
-    await patchThrottle({ backoffUntil: 0 });
-    await mergeState(partial);
-  } catch (err) {
-    console.error("[Claude Usage Badge] fetch error:", err);
-    let errorCode = "unknown";
-    let lastError = err.message || "Failed to fetch usage";
-    if (err instanceof ApiError) {
-      if (err.status === 401 || err.status === 403) {
-        errorCode = "auth";
-        lastError = "Claude session expired or unauthorized.";
-      } else if (err.status === 404) {
-        // A 404 means the endpoint moved, not that the user is signed out.
-        errorCode = "unknown";
-        lastError = "Claude usage API not found — the API may have changed.";
-      } else if (err.status === 429) {
-        errorCode = "network";
-        lastError = "Rate limited by claude.ai — backing off.";
-        await patchThrottle({ backoffUntil: Date.now() + 5 * 60_000 });
-      } else if (err.status === 0) {
-        errorCode = "network";
-        lastError = "Unexpected non-JSON response from claude.ai.";
-      } else {
-        errorCode = "network";
-      }
-    } else if (err instanceof TypeError) {
-      errorCode = "network";
-      lastError = "Network error reaching claude.ai.";
-    }
-    // Note: lastUpdated is NOT touched here — it tracks successful data only.
-    await mergeState({ lastError, errorCode, lastErrorAt: Date.now() });
+    await consoleCycle(force);
+  } catch (e) {
+    console.error("[Claude Usage Badge] console cycle error:", e);
   }
+}
+
+// `full` cycles (alarm, Refresh) fetch everything. Pokes from a claude.ai tab
+// that land between full cycles only re-read /usage for the badge.
+async function claudeCycle(force, full = force) {
+  const now = Date.now();
+  const throttle = await getThrottle();
+  if (!force) {
+    if (now < (throttle.backoffUntil || 0)) return;
+    if (now - (throttle.lastCycleAt || 0) < MIN_CYCLE_GAP_MS) return;
+  }
+  const light = !full && now - (throttle.lastFullAt || 0) < FULL_CYCLE_GAP_MS;
+  await patchThrottle(light ? { lastCycleAt: now } : { lastCycleAt: now, lastFullAt: now });
+  saw429 = false;
+
+  const activeOrgId = await getCookieOrg(CLAUDE_ORIGIN);
+  if (!activeOrgId) {
+    await updateState((s) => ({
+      ...s,
+      activeOrgId: null,
+      lastError: "Not signed in to Claude.",
+      errorCode: "no_org",
+      lastErrorAt: now,
+    }));
+    return;
+  }
+
+  const state = await readState();
+  const flags = {
+    multiOrg: await isUnlocked(FEATURES.MULTI_ORG),
+    team: await isUnlocked(FEATURES.TEAM),
+    force,
+    light,
+  };
+
+  // 1. Which organizations does this login belong to?
+  let orgs = state.orgs;
+  let orgsFetchedAt = state.orgsFetchedAt;
+  let orgsTriedAt = state.orgsTriedAt;
+  const listStale =
+    !orgsFetchedAt || now - orgsFetchedAt > ORGS_TTL_MS ||
+    !orgs.some((o) => o.id === activeOrgId);
+  // A failing list (or one that never contains the active org) is retried on
+  // a cooldown, not every cycle.
+  const mayRetry = !orgsTriedAt || now - orgsTriedAt > ORGS_RETRY_MS;
+  if (force || (listStale && mayRetry && !light)) {
+    orgsTriedAt = now;
+    try {
+      const listed = summarizeOrgs(await claudeApi("/organizations"));
+      if (listed.length) {
+        orgs = listed;
+        orgsFetchedAt = now;
+      }
+    } catch (err) {
+      dbg("org list failed:", err);
+      // Keep the previous list; the active org is still tracked below.
+    }
+  }
+  if (!orgs.some((o) => o.id === activeOrgId)) {
+    orgs = [{ id: activeOrgId, name: null, kind: null, tier: null }, ...orgs];
+  }
+
+  // 2. Pick what to poll this cycle. The org on the badge and the active org
+  //    every cycle; the rest on a slower cadence.
+  const display =
+    state.pinnedOrgId && orgs.some((o) => o.id === state.pinnedOrgId)
+      ? state.pinnedOrgId
+      : activeOrgId;
+  const priority = (o) => (o.id === display ? 0 : o.id === activeOrgId ? 1 : 2);
+  const tracked = [...orgs].sort((a, b) => priority(a) - priority(b)).slice(0, MAX_TRACKED_ORGS);
+  const targets = tracked.filter((o) => {
+    if (o.id === display || o.id === activeOrgId) return true;
+    if (!flags.multiOrg || light) return false;
+    const a = state.accounts[o.id];
+    const last = a ? Math.max(a.lastUpdated || 0, a.lastErrorAt || 0) : 0;
+    return force || now - last > SECONDARY_INTERVAL_MS;
+  });
+
+  // 3. Fetch sequentially — gentle on claude.ai, and a 429 stops the round.
+  const results = {};
+  for (const org of targets) {
+    if (saw429) break;
+    results[org.id] = await fetchAccount(org, state.accounts[org.id], now, flags);
+  }
+  await patchThrottle({ backoffUntil: saw429 ? now + 5 * 60_000 : 0 });
+
+  // An org we can no longer read has probably left this login: re-list on the
+  // next full cycle so it (and any pin on it) is dropped.
+  const polled = Object.values(results);
+  if (polled.some((a) => a.errorCode === "auth")) {
+    orgsFetchedAt = null;
+    orgsTriedAt = null;
+  }
+  // The login itself is only declared dead when nothing we asked for worked —
+  // one unreadable org must not blank a healthy pinned one.
+  const authLost = polled.length > 0 && polled.every((a) => a.errorCode === "auth");
+
+  // 4. Commit. Re-read inside the queue so a concurrent pin/console change
+  //    isn't overwritten by this cycle's snapshot.
+  await updateState((s) => {
+    const keep = new Set(tracked.map((o) => o.id));
+    const accounts = {};
+    for (const id of keep) {
+      let a = results[id] || s.accounts[id];
+      if (!a) continue;
+      // A run budget sniffed from the page while this cycle was in flight is
+      // newer than anything in our snapshot — keep it.
+      const stored = s.accounts[id]?.routineRuns;
+      if (results[id] && stored?.seenAt > now && !(a.routineRuns?.seenAt >= stored.seenAt)) {
+        a = { ...a, routineRuns: stored };
+      }
+      accounts[id] = a;
+    }
+    return {
+      ...s,
+      accounts,
+      orgs: tracked.length < orgs.length ? orgs.filter((o) => keep.has(o.id)) : orgs,
+      orgsFetchedAt,
+      orgsTriedAt,
+      activeOrgId,
+      pinnedOrgId: s.pinnedOrgId && keep.has(s.pinnedOrgId) ? s.pinnedOrgId : null,
+      lastError: authLost ? "Claude session expired or unauthorized." : null,
+      errorCode: authLost ? "auth" : null,
+      lastErrorAt: authLost ? now : s.lastErrorAt,
+    };
+  });
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
-chrome.runtime.onInstalled.addListener(async (details) => {
-  if (details.reason === "install") {
-    await chrome.storage.local.set({ usageState: DEFAULT_STATE });
-  } else {
-    // Update: migrate stored state to the current shape without wiping it.
-    const { usageState } = await chrome.storage.local.get("usageState");
-    await chrome.storage.local.set({
-      usageState: {
-        ...DEFAULT_STATE,
-        ...(usageState || {}),
-        extraUsage: {
-          ...DEFAULT_STATE.extraUsage,
-          ...((usageState && usageState.extraUsage) || {}),
-        },
-      },
-    });
-  }
-  // Drop diagnostic data from previous versions if present.
-  if (!DEBUG) await chrome.storage.local.remove("seenApiPaths");
-  await refreshBadge();
-  fetchUsageAndUpdate();
+function ensureAlarm() {
+  // Recreating an alarm resets its timer — only create it if missing.
+  return chrome.alarms.get("refreshUsage").then((existing) => {
+    if (!existing) chrome.alarms.create("refreshUsage", { periodInMinutes: 3 });
+  });
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  // Migrate whatever is stored to the current shape (inside the write queue).
+  await updateState((s) => s);
+  await chrome.storage.local.remove("seenApiPaths"); // diagnostic data from old versions
+  await ensureAlarm();
+  runCycle(false, true);
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await ensureAlarm();
+  await refreshBadge().catch(() => {});
+  runCycle(false, true);
 });
 
 // Re-render the badge from stored state whenever the worker wakes.
 refreshBadge().catch(() => {});
+ensureAlarm().catch(() => {});
 
-// Recreating an alarm resets its timer — with frequent SW wakes, a
-// re-created 3-minute alarm might never actually fire. Only create it
-// if it doesn't already exist.
-chrome.alarms.get("refreshUsage").then((existing) => {
-  if (!existing) chrome.alarms.create("refreshUsage", { periodInMinutes: 3 });
-});
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "refreshUsage") fetchUsageAndUpdate();
+  if (alarm.name === "refreshUsage") runCycle(false, true);
+});
+
+// Granting the Console permission is what turns the feature on. Handled here
+// (not only in the popup) because Chrome can close the popup while its
+// permission prompt is showing, before the popup gets to send a message.
+chrome.permissions.onAdded.addListener((p) => {
+  if (!(p.origins || []).some((o) => o.startsWith(CONSOLE_ORIGIN))) return;
+  updateState((s) => (s.console?.enabled ? s : { ...s, console: { ...defaultConsole(), enabled: true } }))
+    .then(() => consoleCycle(true));
+});
+
+// The user revoked the Console permission from chrome://extensions.
+chrome.permissions.onRemoved.addListener(() => {
+  consolePermitted().then((ok) => {
+    if (!ok) updateState((s) => ({ ...s, console: defaultConsole() }));
+  });
 });
 
 // ─── Message handlers ───────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === "CLAUDE_USAGE_UPDATE") {
-    fetchUsageAndUpdate()
-      .then(() => sendResponse({ ok: true }))
-      .catch(() => sendResponse({ ok: false }));
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const reply = (p) => {
+    p.then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
     return true;
+  };
+  // Settings-changing messages are only accepted from our own pages (popup),
+  // never from a content script running inside a web page.
+  const fromExtensionPage =
+    sender.id === chrome.runtime.id &&
+    typeof sender.url === "string" &&
+    sender.url.startsWith(chrome.runtime.getURL(""));
+
+  switch (msg?.type) {
+    case "CLAUDE_USAGE_UPDATE":
+      return reply(runCycle());
+    case "FORCE_REFRESH":
+      // Bypasses backoff — only our own pages may ask for it.
+      return reply(runCycle(fromExtensionPage));
+    case "GET_USAGE_STATE":
+      readState()
+        .then((s) => sendResponse(s))
+        .catch(() => sendResponse(defaultState()));
+      return true;
+    case "SET_PINNED_ORG": {
+      if (!fromExtensionPage) break;
+      const id = msg.orgId && UUID_RE.test(msg.orgId) ? msg.orgId : null;
+      return reply(updateState((s) => ({ ...s, pinnedOrgId: id })).then(() => runCycle(true)));
+    }
+    case "CONSOLE_ENABLE":
+      if (!fromExtensionPage) break;
+      return reply(
+        updateState((s) => ({ ...s, console: { ...defaultConsole(), enabled: true } }))
+          .then(() => consoleCycle(true))
+      );
+    case "CONSOLE_DISABLE":
+      if (!fromExtensionPage) break;
+      return reply(updateState((s) => ({ ...s, console: defaultConsole() })));
+    case "SNIFFED_PAYLOAD":
+      handleSniffedPayload(msg.url, msg.body);
+      break;
+    default:
+      break;
   }
-  if (msg?.type === "GET_USAGE_STATE") {
-    chrome.storage.local
-      .get("usageState")
-      .then(({ usageState }) => sendResponse(usageState || DEFAULT_STATE))
-      .catch(() => sendResponse(DEFAULT_STATE));
-    return true;
-  }
-  if (msg?.type === "FORCE_REFRESH") {
-    fetchUsageAndUpdate(true)
-      .then(() => sendResponse({ ok: true }))
-      .catch(() => sendResponse({ ok: false }));
-    return true;
-  }
-  if (msg?.type === "SNIFFED_PAYLOAD") {
-    handleSniffedPayload(msg.url, msg.body);
-    sendResponse({ ok: true });
-    return false;
-  }
-  if (msg?.type === "API_URL_SEEN") {
-    if (DEBUG) recordSeenUrl(msg.url);
-    sendResponse({ ok: true });
-    return false;
-  }
+  sendResponse({ ok: false });
+  return false;
 });
 
-// ─── Diagnostic URL log (DEBUG-only) ───────────────────────────────────────
-// Keeps the last 100 unique /api/ paths the page has hit (with the orgId
-// redacted). Only runs when DEBUG=true above. Helpful when discovering new
-// endpoints; otherwise idle.
-async function recordSeenUrl(url) {
-  if (!url) return;
-  try {
-    const u = new URL(url, "https://claude.ai");
-    const pathRedacted = u.pathname.replace(
-      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
-      "{orgId}"
-    );
-    const { seenApiPaths = [] } = await chrome.storage.local.get("seenApiPaths");
-    if (!seenApiPaths.includes(pathRedacted)) {
-      const next = [...seenApiPaths, pathRedacted].slice(-100);
-      await chrome.storage.local.set({ seenApiPaths: next });
-      dbg("new API path seen:", pathRedacted);
-    }
-  } catch {
-    // ignore
-  }
-}
-
 // ─── Sniffed-payload handling ──────────────────────────────────────────────
-// When the settings/usage page loads, the Claude app itself fetches endpoints
-// we don't directly poll. The content script forwards those responses here so
-// we can extract run budgets without hardcoding endpoint paths.
-
-// Heuristic: given a JSON body from a run-budget-ish URL, find something
-// shaped like a run budget. Keys are deliberately specific — generic pairs
-// like current/total or used/max match pagination and quota objects that
-// have nothing to do with runs.
-function extractRunBudget(body) {
-  if (!body || typeof body !== "object") return null;
-
-  const usedKeys = ["runs_used", "used_runs", "daily_runs_used", "routines_used", "used", "consumed"];
-  const limitKeys = ["runs_limit", "daily_runs_limit", "routines_limit", "run_budget", "daily_limit", "limit", "budget"];
-  const resetKeys = ["resets_at", "reset_at", "next_reset", "next_reset_at"];
-
-  function walk(node, depth = 0) {
-    if (!node || typeof node !== "object" || depth > 3) return null;
-
-    const keys = Object.keys(node);
-    const used = keys.find((k) => usedKeys.includes(k.toLowerCase()));
-    const limit = keys.find((k) => limitKeys.includes(k.toLowerCase()));
-    if (used != null && limit != null) {
-      const u = node[used];
-      const l = node[limit];
-      if (typeof u === "number" && typeof l === "number" && u >= 0 && l >= 0) {
-        const resetKey = keys.find((k) => resetKeys.includes(k.toLowerCase()));
-        return {
-          used: u,
-          limit: l,
-          resetsAt: resetKey ? toEpoch(node[resetKey]) : null,
-        };
-      }
-    }
-
-    for (const v of Object.values(node)) {
-      if (v && typeof v === "object") {
-        const found = walk(v, depth + 1);
-        if (found) return found;
-      }
-    }
-    return null;
-  }
-
-  return walk(body);
-}
+// When claude.ai itself loads a run-budget endpoint we don't poll, the content
+// script forwards that response so the budget can be shown without guessing
+// endpoint paths.
 
 async function handleSniffedPayload(url, body) {
-  dbg("sniffed:", url, body);
-  if (!url || !body) return;
-
-  // Only treat this as run-budget data when the URL clearly says so.
-  // Bare "agent"/"budget" matched far too many unrelated endpoints.
-  const isRoutineLike =
-    /\broutines?\b|run[-_]?budget|cowork/i.test(url) && !/\/usage(\?|$)/i.test(url);
-  if (!isRoutineLike) return;
+  dbg("sniffed:", url);
+  if (typeof url !== "string" || !body || typeof body !== "object") return;
+  // Only responses from claude.ai's own API count.
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url, CLAUDE_ORIGIN);
+  } catch {
+    return;
+  }
+  if (parsedUrl.origin !== CLAUDE_ORIGIN || !/^\/(api|v1)\//.test(parsedUrl.pathname)) return;
+  if (!/\broutines?\b|run[-_]?budget/i.test(parsedUrl.pathname)) return;
 
   const budget = extractRunBudget(body);
-  if (budget) {
-    await mergeState({ routineRuns: budget });
-  }
+  if (!budget) return;
+  const now = Date.now();
+  // Attribute to the org named in the URL when there is one.
+  const inUrl = url.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || null;
+  await updateState((s) => {
+    const orgId = inUrl && s.accounts[inUrl] ? inUrl : s.activeOrgId;
+    const acct = orgId ? s.accounts[orgId] : null;
+    if (!acct) return s;
+    return {
+      ...s,
+      accounts: { ...s.accounts, [orgId]: { ...acct, routineRuns: { ...budget, seenAt: now } } },
+    };
+  });
 }

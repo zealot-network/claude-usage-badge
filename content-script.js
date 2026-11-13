@@ -8,7 +8,7 @@
   const TAG = "__CLAUDE_USAGE_BADGE__";
 
   let lastPoke = 0;
-  const POKE_COOLDOWN_MS = 10_000;
+  const POKE_COOLDOWN_MS = 8_000;
 
   // Safe wrapper: after the extension is reloaded the content script's
   // `chrome` reference is stale and sendMessage throws SYNCHRONOUSLY with
@@ -38,17 +38,6 @@
     safeSend({ type: "SNIFFED_PAYLOAD", url, body });
   }
 
-  // Dedupe URLs locally so we don't flood the service worker with the same
-  // path on every fetch. Capped so a long-lived SPA tab can't grow the set
-  // without bound.
-  const sentUrls = new Set();
-  function forwardSeenUrl(url) {
-    if (!url || sentUrls.has(url)) return;
-    if (sentUrls.size >= 500) sentUrls.clear();
-    sentUrls.add(url);
-    safeSend({ type: "API_URL_SEEN", url });
-  }
-
   // Bridge: listen for main-world posts from page-inject.js.
   // Only accept messages posted by THIS window at our own origin — an
   // embedded iframe or other frame could otherwise forge extension messages.
@@ -58,13 +47,13 @@
     const msg = ev.data;
     if (!msg || msg.__tag !== TAG) return;
     if (msg.type === "COMPLETION_SENT") {
-      // Wait a beat for the backend to settle usage counters
-      setTimeout(pokeBackground, 2500);
+      // This fires when the reply STARTS streaming. Poke once early, then
+      // again later so the badge also reflects the finished message instead
+      // of waiting for the next 3-minute alarm.
+      for (const delay of [2500, 20_000, 60_000]) setTimeout(pokeBackground, delay);
     } else if (msg.type === "SNIFFED_PAYLOAD") {
       const { url, body } = msg.payload || {};
       if (url && body) forwardSniffed(url, body);
-    } else if (msg.type === "API_URL_SEEN") {
-      forwardSeenUrl(msg.payload?.url);
     }
   });
 

@@ -1,33 +1,14 @@
-// popup.js — Reads UsageState from storage and renders the popup UI.
+// popup.js — Reads state from the service worker and renders the popup UI.
 
-const DEFAULT_STATE = {
-  buckets: [],
-  routineRuns: null,
-  extraUsage: {
-    enabled: null,
-    inUse: null,
-    spentUsd: null,
-    limitUsd: null,
-    status: null,
-    disabledReason: null,
-    overLimit: null,
-    balanceUsd: null,
-    utilization: null,
-    severity: null,
-    canToggle: null,
-    autoReload: null,
-    resetsAt: null,
-  },
-  subscriptionTier: null,
-  tierFetchedAt: null,
-  orgId: null,
-  lastUpdated: null,
-  lastErrorAt: null,
-  lastError: null,
-  errorCode: null,
-};
+import { CLAUDE_ORIGIN, CONSOLE_ORIGIN } from "./config.js";
+import {
+  defaultState, defaultAccount, migrateState, displayOrgId,
+  formatTier, formatMoney, formatDuration, liveRoutineRuns,
+} from "./lib/core.js";
 
-const USAGE_URL = "https://claude.ai/settings/usage";
+const USAGE_URL = `${CLAUDE_ORIGIN}/settings/usage`;
+const CONSOLE_URL = `${CONSOLE_ORIGIN}/settings/billing`;
+const CONSOLE_PERMISSION = { origins: [`${CONSOLE_ORIGIN}/*`] };
 
 const ERROR_COPY = {
   no_org: {
@@ -51,6 +32,16 @@ const ERROR_COPY = {
       "<li>Open <strong>claude.ai/settings/usage</strong> to confirm you're online</li>" +
       "<li>Come back and click <strong>Refresh</strong></li></ol>",
   },
+  rate_limited: {
+    title: "Claude is rate limiting us",
+    body: "claude.ai asked us to slow down. Usage will refresh again automatically in a few minutes.",
+  },
+  shape: {
+    title: "Claude changed its usage data",
+    body:
+      "claude.ai returned usage in a format this version doesn't understand. " +
+      "Check the Chrome Web Store for an update to this extension.",
+  },
   unknown: {
     title: "Couldn't load usage",
     body:
@@ -59,6 +50,12 @@ const ERROR_COPY = {
       "<li>Come back and click <strong>Refresh</strong></li></ol>",
   },
 };
+
+// Which account tab is showing. null = follow whatever drives the badge.
+let selectedOrgId = null;
+let lastState = defaultState();
+
+const $ = (id) => document.getElementById(id);
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -76,41 +73,16 @@ function formatPct(pct) {
 function formatResetTime(ts) {
   if (!ts) return "";
   const diff = ts - Date.now();
-  if (diff <= 0) return "Resets soon";
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `Resets in ${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 48) {
-    const rm = mins % 60;
-    return rm > 0 ? `Resets in ${hrs}h ${rm}m` : `Resets in ${hrs}h`;
-  }
-  const days = Math.floor(hrs / 24);
-  const rh = hrs % 24;
-  return rh > 0 ? `Resets in ${days}d ${rh}h` : `Resets in ${days}d`;
+  if (diff < 60_000) return "Resets soon";
+  return `Resets in ${formatDuration(diff)}`;
 }
 
 function formatLastUpdated(ts) {
   if (!ts) return "No data yet";
-  const diff = Date.now() - ts;
-  const mins = Math.round(diff / 60000);
+  const mins = Math.round((Date.now() - ts) / 60000);
   if (mins <= 0) return "Updated just now";
-  if (mins === 1) return "Updated 1m ago";
   if (mins < 60) return `Updated ${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  return `Updated ${hrs}h ago`;
-}
-
-function formatTier(tier) {
-  if (!tier) return "—";
-  const map = {
-    free: "Free",
-    pro: "Pro",
-    team: "Team",
-    enterprise: "Enterprise",
-    max_5x: "Max 5×",
-    max_20x: "Max 20×",
-  };
-  return map[tier] || tier;
+  return `Updated ${Math.floor(mins / 60)}h ago`;
 }
 
 // Maps the API's severity string to a bar color, falling back to % bands.
@@ -121,45 +93,44 @@ function severityColor(severity, pct) {
   return barColor(pct);
 }
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
 // Builds a bar section with ARIA progressbar semantics.
 function buildBarSection({ label, valueText, pct, resetsAt, inactive, overLimit, severity }) {
-  const fillPct = pct != null ? Math.min(100, pct) : 0;
+  const fillPct = pct != null ? Math.max(0, Math.min(100, pct)) : 0;
 
-  const section = document.createElement("div");
-  section.className = inactive ? "section inactive" : "section";
-  section.innerHTML = `
-    <div class="label-row">
-      <span class="label"></span>
-      <span class="value"></span>
-    </div>
-    <div class="bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-      <div class="bar-fill"></div>
-    </div>
-    <div class="reset-time"></div>
-  `;
-  section.querySelector(".label").textContent = label;
-  const valueEl = section.querySelector(".value");
-  valueEl.textContent = valueText;
+  const section = el("div", inactive ? "section inactive" : "section");
+  const row = el("div", "label-row");
+  row.appendChild(el("span", "label", label));
+  const valueEl = el("span", "value", valueText);
   if (overLimit) valueEl.style.color = "var(--red)";
+  row.appendChild(valueEl);
 
-  const track = section.querySelector(".bar-track");
+  const track = el("div", "bar-track");
+  track.setAttribute("role", "progressbar");
+  track.setAttribute("aria-valuemin", "0");
+  track.setAttribute("aria-valuemax", "100");
   track.setAttribute("aria-label", label);
   if (pct != null) {
-    track.setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
+    track.setAttribute("aria-valuenow", String(Math.round(fillPct)));
     if (overLimit) track.setAttribute("aria-valuetext", valueText + " — over limit");
   } else {
     track.setAttribute("aria-valuetext", inactive ? "Not active" : "No data");
   }
-
-  const fill = section.querySelector(".bar-fill");
+  const fill = el("div", "bar-fill");
   fill.style.width = `${fillPct}%`;
   fill.style.backgroundColor = pct != null ? severityColor(severity, pct) : "var(--surface)";
-  section.querySelector(".reset-time").textContent = inactive ? "" : formatResetTime(resetsAt);
+  track.appendChild(fill);
 
+  section.append(row, track, el("div", "reset-time", inactive ? "" : formatResetTime(resetsAt)));
   return section;
 }
 
-// Renders one bucket (label, %, bar, reset) into the given container.
 function renderBucket(container, bucket) {
   const inactive = !!bucket.inactive;
   const pct = bucket.utilization;
@@ -176,20 +147,13 @@ function renderBucket(container, bucket) {
   );
 }
 
-// Renders the Scheduled/run-budget bucket (uses used/limit rather than %).
 function renderRoutineRuns(container, runs) {
   const { used, limit, resetsAt } = runs;
-  let pct = null;
-  if (used != null && limit != null && limit > 0) {
-    pct = (used / limit) * 100;
-  }
-  const valueText =
-    used != null && limit != null ? `${used} / ${limit}` : used != null ? `${used}` : "—";
-
+  const pct = used != null && limit > 0 ? (used / limit) * 100 : null;
   container.appendChild(
     buildBarSection({
       label: "Scheduled runs",
-      valueText,
+      valueText: used != null && limit != null ? `${used} / ${limit}` : used != null ? `${used}` : "—",
       pct,
       resetsAt,
       inactive: false,
@@ -198,104 +162,89 @@ function renderRoutineRuns(container, runs) {
   );
 }
 
+// Is this weekly bucket a per-model limit (vs. a product surface)?
+function isModelBucket(b) {
+  if (b.scopeType) return b.scopeType === "model";
+  // Buckets stored by older versions carry no scopeType.
+  return !["seven_day_cowork", "seven_day_oauth_apps"].includes(b.key);
+}
+
+function orgLabel(org, acct, index) {
+  if (org?.name) return org.name;
+  if (acct?.name) return acct.name;
+  const kind = org?.kind || acct?.kind;
+  if (kind === "team") return "Team";
+  if (kind === "enterprise") return "Enterprise";
+  return `Account ${index + 1}`;
+}
+
 // ─── Render ─────────────────────────────────────────────────────────────────
 
-function render(state) {
-  const $ = (id) => document.getElementById(id);
+function renderAccountSwitcher(state, shownOrgId) {
+  const tabs = $("account-tabs");
+  const pinRow = $("pin-row");
+  // Rebuilding the buttons must not throw keyboard focus back to <body>.
+  const focusedOrg = tabs.contains(document.activeElement)
+    ? document.activeElement.dataset.org
+    : null;
+  tabs.textContent = "";
+  const orgs = state.orgs || [];
+  if (orgs.length < 2) {
+    tabs.style.display = "none";
+    pinRow.style.display = "none";
+    return;
+  }
+  tabs.style.display = "";
+  orgs.forEach((org, i) => {
+    const acct = state.accounts[org.id];
+    const btn = el("button", "tab");
+    btn.type = "button";
+    btn.dataset.org = org.id;
+    btn.setAttribute("aria-pressed", String(org.id === shownOrgId));
+    const name = orgLabel(org, acct, i);
+    const tier = formatTier(acct?.subscriptionTier || org.tier || org.tierGuess);
+    const isActive = org.id === state.activeOrgId;
+    const isPinned = org.id === state.pinnedOrgId;
+    const full = [name, tier !== "—" ? tier : null, isActive ? "open in Claude" : null,
+      isPinned ? "badge pinned here" : null].filter(Boolean).join(" — ");
+    btn.title = full;
+    btn.setAttribute("aria-label", full);
+    const top = el("span", "tab-top");
+    if (isActive) top.appendChild(el("span", "tab-dot"));
+    top.appendChild(el("span", "tab-name", name));
+    if (isPinned) top.appendChild(el("span", "tab-pin", "★"));
+    btn.appendChild(top);
+    btn.appendChild(el("span", "tab-meta", tier));
+    btn.addEventListener("click", () => {
+      selectedOrgId = org.id;
+      render(lastState);
+    });
+    tabs.appendChild(btn);
+    if (org.id === focusedOrg) btn.focus();
+  });
 
-  // Error banner + inline error label. The prompt shows when we have a
-  // meaningful errorCode AND no fresh data to display.
-  const hasErrorCode = !!state.errorCode;
-  const hasAnyData = (state.buckets || []).length > 0;
-  const showPrompt = hasErrorCode && !hasAnyData;
-
-  const promptEl = $("error-prompt");
-  if (showPrompt) {
-    const copy = ERROR_COPY[state.errorCode] || ERROR_COPY.unknown;
-    $("error-prompt-title").textContent = copy.title;
-    $("error-prompt-body").innerHTML = copy.body;
-    promptEl.style.display = "";
+  // Pin control: which account the toolbar badge follows.
+  pinRow.style.display = "";
+  const pinned = state.pinnedOrgId;
+  const badgeOrg = displayOrgId(state);
+  const label = $("pin-label");
+  const btn = $("pin-btn");
+  if (pinned && pinned === shownOrgId) {
+    label.textContent = "★ Badge is pinned to this account";
+    btn.textContent = "Follow active account";
+    btn.dataset.pin = "";
+  } else if (badgeOrg === shownOrgId) {
+    label.textContent = "● Open in Claude — the badge follows it";
+    btn.textContent = "Pin to this account";
+    btn.dataset.pin = shownOrgId;
   } else {
-    promptEl.style.display = "none";
+    label.textContent = "Badge is showing another account";
+    btn.textContent = "Pin to this account";
+    btn.dataset.pin = shownOrgId;
   }
+}
 
-  const errorEl = $("error-label");
-  // When the prompt is shown, suppress the small inline error to avoid redundancy.
-  if (state.lastError && !showPrompt) {
-    errorEl.textContent = `Last refresh failed: ${state.lastError}`;
-    errorEl.style.display = "block";
-  } else {
-    errorEl.style.display = "none";
-  }
-
-  // Tier
-  const tierEl = $("tier-pill");
-  tierEl.textContent = formatTier(state.subscriptionTier);
-  tierEl.title = state.subscriptionTier
-    ? "Detected Claude plan"
-    : "Plan not detected yet — open claude.ai and refresh";
-
-  // Session (5h) — always first slot
-  const sessionSlot = $("session-slot");
-  sessionSlot.innerHTML = "";
-  const session = (state.buckets || []).find((b) => b.key === "five_hour");
-  if (session) {
-    renderBucket(sessionSlot, session);
-  } else if (!showPrompt) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "No session data yet";
-    sessionSlot.appendChild(empty);
-  }
-
-  // Weekly buckets — split across two slots so the Extra Usage card can sit
-  // between the primary "all models" bar and the per-model bars below it.
-  const weeklyHeading = $("weekly-heading");
-  const weeklyPrimarySlot = $("weekly-primary-slot");
-  const weeklySecondaryHeading = $("weekly-secondary-heading");
-  const weeklySecondarySlot = $("weekly-secondary-slot");
-  weeklyPrimarySlot.innerHTML = "";
-  weeklySecondarySlot.innerHTML = "";
-
-  // Weekly buckets that aren't per-model (Scheduled, OAuth apps) belong under
-  // "Other limits", not the "By model" sub-heading.
-  const NON_MODEL_WEEKLY = new Set(["seven_day_cowork", "seven_day_oauth_apps"]);
-
-  const weeklyBuckets = (state.buckets || []).filter(
-    (b) => b.key !== "five_hour" && (b.key.startsWith("seven_day") || /weekly/i.test(b.key))
-  );
-  const weeklyPrimary = weeklyBuckets.find((b) => b.key === "seven_day");
-  const weeklyModels = weeklyBuckets.filter(
-    (b) => b.key !== "seven_day" && !NON_MODEL_WEEKLY.has(b.key)
-  );
-  const weeklyNonModel = weeklyBuckets.filter((b) => NON_MODEL_WEEKLY.has(b.key));
-
-  if (weeklyPrimary) renderBucket(weeklyPrimarySlot, weeklyPrimary);
-  weeklyModels.forEach((b) => renderBucket(weeklySecondarySlot, b));
-  weeklyHeading.style.display = weeklyBuckets.length > 0 ? "" : "none";
-  weeklySecondaryHeading.style.display = weeklyModels.length > 0 ? "" : "none";
-
-  // Other limits — Scheduled runs, non-model weekly buckets, and anything
-  // that isn't session/weekly-model.
-  const dailyGroup = $("daily-group");
-  const dailySlot = $("daily-slot");
-  dailySlot.innerHTML = "";
-  const otherBuckets = (state.buckets || []).filter(
-    (b) =>
-      b.key !== "five_hour" &&
-      !b.key.startsWith("seven_day") &&
-      !/weekly/i.test(b.key)
-  );
-  weeklyNonModel.forEach((b) => renderBucket(dailySlot, b));
-  otherBuckets.forEach((b) => renderBucket(dailySlot, b));
-  if (state.routineRuns) {
-    renderRoutineRuns(dailySlot, state.routineRuns);
-  }
-  dailyGroup.style.display = dailySlot.children.length > 0 ? "" : "none";
-
-  // ── Usage credits — status-aware (on / paused / off / unknown) ────────────
-  const extra = state.extraUsage || {};
-  // status is authoritative when present; fall back to the enabled boolean.
+function renderCredits(extra, isSeat) {
   let status = extra.status;
   if (status == null) {
     if (extra.enabled === true) status = "on";
@@ -304,126 +253,300 @@ function render(state) {
   const known = status != null;
   const active = status === "on" || status === "paused";
   const inUse = !!extra.inUse;
-  const overLimit = extra.overLimit === true;
+  const overLimit = extra.overLimit === true && active;
+  const cur = extra.currency || "USD";
 
-  const section = $("extra-section");
-  section.classList.toggle("over-limit", overLimit);
+  $("extra-section").classList.toggle("over-limit", overLimit);
 
-  // Status pill
-  const enabledPill = $("extra-enabled-pill");
-  enabledPill.classList.remove("pill-on", "pill-off", "pill-neutral", "pill-paused");
+  const pill = $("extra-enabled-pill");
+  pill.classList.remove("pill-on", "pill-off", "pill-neutral", "pill-paused");
   if (!known) {
-    enabledPill.textContent = "—";
-    enabledPill.classList.add("pill-neutral");
+    pill.textContent = "—";
+    pill.classList.add("pill-neutral");
   } else if (status === "on") {
-    enabledPill.textContent = "ON";
-    enabledPill.classList.add("pill-on");
+    pill.textContent = "ON";
+    pill.classList.add("pill-on");
   } else if (status === "paused") {
-    enabledPill.textContent = overLimit ? "OVER LIMIT" : "PAUSED";
-    enabledPill.classList.add("pill-paused");
+    pill.textContent = overLimit ? "OVER LIMIT" : "PAUSED";
+    pill.classList.add("pill-paused");
   } else {
-    enabledPill.textContent = "OFF";
-    enabledPill.classList.add("pill-off");
+    pill.textContent = "OFF";
+    pill.classList.add("pill-off");
   }
-
-  // "IN USE" only when actively drawing (on + a limit exhausted).
   $("extra-active-pill").style.display = status === "on" && inUse ? "inline" : "none";
 
   const detailEl = $("extra-detail");
   const barWrap = $("extra-bar-wrap");
-  const extraBar = $("extra-bar");
-  const extraBarTrack = $("extra-bar-track");
-  const extraResetEl = $("extra-reset");
+  detailEl.textContent = "";
 
   if (!known) {
     detailEl.textContent = "Waiting for data…";
     barWrap.style.display = "none";
-  } else if (!active) {
-    detailEl.textContent = "Off — Claude pauses when you hit a limit";
+    return;
+  }
+  if (!active) {
+    detailEl.textContent = extra.byOrg
+      ? "Turned off for this organization — Claude pauses when you hit a limit"
+      : isSeat
+        ? "Off for your seat — ask an owner to enable usage credits"
+        : "Off — Claude pauses when you hit a limit";
     barWrap.style.display = "none";
-  } else {
-    const uPct = typeof extra.utilization === "number" ? Math.round(extra.utilization) : null;
-    const parts = [];
-    if (extra.spentUsd != null && extra.limitUsd != null && extra.limitUsd > 0) {
-      const pctTag =
-        uPct != null
-          ? ` · <span class="${overLimit ? "over" : ""}">${uPct}%</span>`
-          : "";
-      parts.push(
-        `<strong>$${extra.spentUsd.toFixed(2)}</strong> of $${extra.limitUsd.toFixed(2)}${pctTag}`
-      );
-    } else if (extra.spentUsd != null) {
-      parts.push(`<strong>$${extra.spentUsd.toFixed(2)}</strong> spent`);
-    }
-    const line2 = [];
-    if (extra.balanceUsd != null) line2.push(`$${extra.balanceUsd.toFixed(2)} balance`);
-    if (extra.autoReload === true) line2.push("auto-reload on");
-    else if (extra.autoReload === false) line2.push("auto-reload off");
-
-    let html = parts.join(" · ") || "Enabled — no spend data";
-    if (line2.length) html += `<div class="extra-sub">${line2.join(" · ")}</div>`;
-    // Paused/over-limit gets an explicit, louder note.
-    if (status === "paused") {
-      const note = overLimit
-        ? "Over your monthly limit — credits paused"
-        : "Credits paused";
-      html += `<div class="extra-note">${note}</div>`;
-    }
-    detailEl.innerHTML = html;
-
-    // Progress bar — uncapped utilization, red when over limit.
-    let pct = null;
-    if (typeof extra.utilization === "number") pct = extra.utilization;
-    else if (extra.limitUsd != null && extra.limitUsd > 0 && extra.spentUsd != null) {
-      pct = (extra.spentUsd / extra.limitUsd) * 100;
-    }
-    if (pct != null) {
-      extraBar.style.width = `${Math.min(100, pct)}%`;
-      extraBar.style.backgroundColor = severityColor(extra.severity, pct);
-      if (extraBarTrack) {
-        extraBarTrack.setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
-        if (overLimit) {
-          extraBarTrack.setAttribute("aria-valuetext", `${Math.round(pct)}% — over limit`);
-        }
-      }
-      extraResetEl.textContent = formatResetTime(extra.resetsAt);
-      barWrap.style.display = "";
-    } else {
-      barWrap.style.display = "none";
-    }
+    return;
   }
 
+  const uPct = typeof extra.utilization === "number" ? Math.round(extra.utilization) : null;
+  const line1 = el("div");
+  if (extra.spentUsd != null && extra.limitUsd != null && extra.limitUsd > 0) {
+    line1.appendChild(el("strong", null, formatMoney(extra.spentUsd, cur)));
+    line1.appendChild(document.createTextNode(` of ${formatMoney(extra.limitUsd, cur)}`));
+    if (uPct != null) {
+      line1.appendChild(document.createTextNode(" · "));
+      line1.appendChild(el("span", overLimit ? "over" : "", `${uPct}%`));
+    }
+  } else if (extra.spentUsd != null) {
+    line1.appendChild(el("strong", null, formatMoney(extra.spentUsd, cur)));
+    line1.appendChild(document.createTextNode(" spent"));
+  } else {
+    line1.textContent = "Enabled — no spend data";
+  }
+  detailEl.appendChild(line1);
+
+  const line2 = [];
+  if (extra.scope === "member") line2.push("your seat's monthly limit");
+  else if (extra.scope === "organization") line2.push("organization monthly limit");
+  if (extra.balanceUsd != null) line2.push(`${formatMoney(extra.balanceUsd, cur)} balance`);
+  if (extra.autoReload === true) line2.push("auto-reload on");
+  else if (extra.autoReload === false) line2.push("auto-reload off");
+  if (line2.length) detailEl.appendChild(el("div", "extra-sub", line2.join(" · ")));
+  if (status === "paused") {
+    const why = /out_of_credits/.test(extra.disabledReason || "")
+      ? "Out of credits — add credits to resume"
+      : /spend_limit/.test(extra.disabledReason || "")
+        ? "Monthly spend limit reached — credits paused"
+        : overLimit ? "Over your monthly limit — credits paused" : "Credits paused";
+    detailEl.appendChild(el("div", "extra-note", why));
+  }
+
+  let pct = null;
+  if (typeof extra.utilization === "number") pct = extra.utilization;
+  else if (extra.limitUsd > 0 && extra.spentUsd != null) pct = (extra.spentUsd / extra.limitUsd) * 100;
+  if (pct == null) {
+    barWrap.style.display = "none";
+    return;
+  }
+  $("extra-bar").style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  $("extra-bar").style.backgroundColor = overLimit ? "var(--red)" : severityColor(extra.severity, pct);
+  const track = $("extra-bar-track");
+  track.setAttribute("aria-valuenow", String(Math.round(Math.max(0, Math.min(100, pct)))));
+  if (overLimit) track.setAttribute("aria-valuetext", `${Math.round(pct)}% — over limit`);
+  else track.removeAttribute("aria-valuetext");
+  $("extra-reset").textContent = formatResetTime(extra.resetsAt);
+  barWrap.style.display = "";
+}
+
+function renderConsole(con) {
+  const title = $("console-title");
+  const btn = $("console-toggle-btn");
+  const detail = $("console-detail");
+  const rows = $("console-rows");
+  const barWrap = $("console-bar-wrap");
+  rows.textContent = "";
+  barWrap.style.display = "none";
+
+  // Not connected: one quiet line, no card.
+  $("console-block").style.display = con?.enabled ? "" : "none";
+  $("console-cta").style.display = con?.enabled ? "none" : "";
+  if (!con?.enabled) return;
+
+  title.textContent = con.orgName || "API usage";
+  btn.textContent = "Disconnect";
+
+  const cur = con.currency || "USD";
+  const addRow = (k, v) => {
+    const row = el("div", "console-row");
+    row.append(el("span", "k", k), el("span", "v", v));
+    rows.appendChild(row);
+  };
+  if (con.balanceUsd != null) {
+    addRow("Credit balance", formatMoney(con.balanceUsd, cur));
+  }
+  if (con.spendUsd != null) {
+    addRow(
+      "Spend this month",
+      con.spendLimitUsd != null
+        ? `${formatMoney(con.spendUsd, cur)} of ${formatMoney(con.spendLimitUsd, cur)}`
+        : formatMoney(con.spendUsd, cur)
+    );
+  }
+  if (con.autoReload != null) addRow("Auto-reload", con.autoReload ? "On" : "Off");
+  if (con.expiresAt && con.balanceUsd > 0 && con.expiresAt > Date.now()) {
+    addRow("Credits expire", `in ${formatDuration(con.expiresAt - Date.now())}`);
+  }
+  if (con.tier) addRow("Usage tier", con.tier);
+
+  if (con.lastError) {
+    detail.style.display = "";
+    detail.textContent = "";
+    detail.appendChild(el("span", "over", con.lastError));
+    if (con.errorCode === "auth") {
+      detail.appendChild(document.createTextNode(" "));
+      const open = el("button", "link-btn", "Open the Console");
+      open.type = "button";
+      open.addEventListener("click", () => chrome.tabs.create({ url: CONSOLE_URL }));
+      detail.appendChild(open);
+    }
+  } else if (!rows.children.length) {
+    detail.style.display = "";
+    detail.textContent = "Loading…";
+  } else {
+    detail.style.display = "none";
+  }
+
+  if (con.spendUsd != null && con.spendLimitUsd > 0) {
+    const pct = (con.spendUsd / con.spendLimitUsd) * 100;
+    $("console-bar").style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    $("console-bar").style.backgroundColor = barColor(pct);
+    $("console-bar-track").setAttribute("aria-valuenow", String(Math.round(Math.min(100, pct))));
+    $("console-reset").textContent = formatResetTime(con.resetsAt);
+    barWrap.style.display = "";
+  }
+}
+
+function render(rawState) {
+  const state = migrateState(rawState);
+  lastState = state;
+
+  // Which account is on screen: the user's tab choice if it still exists,
+  // otherwise whatever the badge shows.
+  const known = (id) => !!id && (state.orgs.some((o) => o.id === id) || !!state.accounts[id]);
+  if (!known(selectedOrgId)) selectedOrgId = null;
+  const shownOrgId = selectedOrgId || displayOrgId(state);
+  const acct = (shownOrgId && state.accounts[shownOrgId]) || defaultAccount(shownOrgId);
+  const org = state.orgs.find((o) => o.id === shownOrgId) || null;
+  const buckets = acct.buckets || [];
+  const hasAnyData = buckets.length > 0;
+
+  // Login-level problems (signed out / session expired) always show the
+  // guided prompt, even when older numbers are cached. Per-account problems
+  // show it only when there is nothing to display.
+  const loginError = state.errorCode === "no_org" || state.errorCode === "auth";
+  const errorCode = loginError ? state.errorCode : acct.errorCode;
+  const showPrompt = loginError || (!!errorCode && !hasAnyData);
+
+  const promptEl = $("error-prompt");
+  if (showPrompt) {
+    const copy = ERROR_COPY[errorCode] || ERROR_COPY.unknown;
+    $("error-prompt-title").textContent = copy.title;
+    $("error-prompt-body").innerHTML = copy.body; // static copy from this file only
+    promptEl.style.display = "";
+  } else {
+    promptEl.style.display = "none";
+  }
+
+  renderAccountSwitcher(state, shownOrgId);
+
+  // Stale numbers from before sign-out must not look live.
+  document.body.classList.toggle("stale", loginError && hasAnyData);
+  const acctErr = $("account-error");
+  if (loginError && hasAnyData) {
+    acctErr.textContent = "Showing the last numbers from before you were signed out.";
+    acctErr.style.display = "";
+  } else {
+    acctErr.style.display = "none";
+  }
+
+  const errorEl = $("error-label");
+  if (acct.lastError && !showPrompt) {
+    errorEl.textContent = `Last refresh failed: ${acct.lastError}`;
+    errorEl.style.display = "block";
+  } else {
+    errorEl.style.display = "none";
+  }
+
+  // Tier
+  const tier = acct.subscriptionTier || org?.tier || null;
+  const tierEl = $("tier-pill");
+  tierEl.textContent = formatTier(tier);
+  tierEl.title = tier ? "Detected Claude plan" : "Plan not detected yet — open claude.ai and refresh";
+
+  // Session (5h). Some plans (verified Ultra) have no session limit at all.
+  const sessionSlot = $("session-slot");
+  sessionSlot.textContent = "";
+  const session = buckets.find((b) => b.key === "five_hour");
+  if (session) {
+    renderBucket(sessionSlot, session);
+  } else if (!showPrompt) {
+    sessionSlot.appendChild(
+      el("div", "empty",
+        hasAnyData ? "No session limit on this plan"
+          : acct.lastUpdated ? "No session or weekly limits on this plan"
+          : "No usage data yet")
+    );
+  }
+
+  // Weekly buckets — split so the credits card sits between the primary
+  // "all models" bar and the per-model bars below it.
+  const weeklyPrimarySlot = $("weekly-primary-slot");
+  const weeklySecondarySlot = $("weekly-secondary-slot");
+  weeklyPrimarySlot.textContent = "";
+  weeklySecondarySlot.textContent = "";
+
+  const isWeekly = (b) => b.key.startsWith("seven_day") || /weekly/i.test(b.key);
+  const weeklyBuckets = buckets.filter((b) => b.key !== "five_hour" && isWeekly(b));
+  const weeklyPrimary = weeklyBuckets.find((b) => b.key === "seven_day");
+  const weeklyModels = weeklyBuckets.filter((b) => b.key !== "seven_day" && isModelBucket(b));
+  const weeklySurfaces = weeklyBuckets.filter((b) => b.key !== "seven_day" && !isModelBucket(b));
+
+  if (weeklyPrimary) renderBucket(weeklyPrimarySlot, weeklyPrimary);
+  weeklyModels.forEach((b) => renderBucket(weeklySecondarySlot, b));
+  $("weekly-heading").style.display = weeklyBuckets.length > 0 ? "" : "none";
+  $("weekly-secondary-heading").style.display = weeklyModels.length > 0 ? "" : "none";
+
+  // Other limits — product surfaces, scheduled runs, anything unrecognised.
+  const dailySlot = $("daily-slot");
+  dailySlot.textContent = "";
+  weeklySurfaces.forEach((b) => renderBucket(dailySlot, b));
+  buckets
+    .filter((b) => b.key !== "five_hour" && !isWeekly(b))
+    .forEach((b) => renderBucket(dailySlot, b));
+  const runs = liveRoutineRuns(acct.routineRuns);
+  if (runs) renderRoutineRuns(dailySlot, runs);
+  $("daily-group").style.display = dailySlot.children.length > 0 ? "" : "none";
+
+  const isSeat = (acct.kind || org?.kind) === "team" || (acct.kind || org?.kind) === "enterprise";
+  renderCredits(acct.extraUsage || {}, isSeat);
+  renderConsole(state.console);
+
   // Meta — reflects the last SUCCESSFUL fetch only; errors are shown separately.
-  $("meta-label").textContent = formatLastUpdated(state.lastUpdated);
+  $("meta-label").textContent = formatLastUpdated(acct.lastUpdated);
 }
 
 // ─── Init ───────────────────────────────────────────────────────────────────
 
-function normalizeState(state) {
-  return {
-    ...DEFAULT_STATE,
-    ...(state || {}),
-    extraUsage: { ...DEFAULT_STATE.extraUsage, ...((state && state.extraUsage) || {}) },
-  };
+function send(msg) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(msg, (resp) => {
+        void chrome.runtime.lastError;
+        resolve(resp);
+      });
+    } catch {
+      resolve(undefined);
+    }
+  });
 }
 
 async function loadAndRender() {
   try {
-    const state = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: "GET_USAGE_STATE" }, (resp) => {
-        if (chrome.runtime.lastError) {
-          chrome.storage.local.get("usageState", ({ usageState }) => {
-            resolve(usageState || DEFAULT_STATE);
-          });
-        } else {
-          resolve(resp || DEFAULT_STATE);
-        }
-      });
-    });
-    render(normalizeState(state));
-  } catch {
-    document.getElementById("error-label").textContent = "Failed to load state.";
-    document.getElementById("error-label").style.display = "block";
+    let state = await send({ type: "GET_USAGE_STATE" });
+    if (!state) {
+      const { usageState } = await chrome.storage.local.get("usageState");
+      state = usageState;
+    }
+    render(state);
+  } catch (e) {
+    $("error-label").textContent = "Failed to load state.";
+    $("error-label").style.display = "block";
   }
 }
 
@@ -433,38 +556,59 @@ document.addEventListener("DOMContentLoaded", () => {
   // Live updates: re-render whenever the background writes new state, and
   // tick the relative timestamps while the popup stays open.
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.usageState) {
-      render(normalizeState(changes.usageState.newValue));
-    }
+    if (area === "local" && changes.usageState) render(changes.usageState.newValue);
   });
-  setInterval(loadAndRender, 30_000);
+  setInterval(() => render(lastState), 30_000);
 
-  const btn = document.getElementById("refresh-btn");
-  btn.addEventListener("click", () => {
+  const btn = $("refresh-btn");
+  btn.addEventListener("click", async () => {
     btn.textContent = "…";
     btn.disabled = true;
     btn.setAttribute("aria-busy", "true");
-
-    let finished = false;
-    const done = () => {
-      if (finished) return;
-      finished = true;
-      loadAndRender();
-      btn.textContent = "Refresh";
-      btn.disabled = false;
-      btn.removeAttribute("aria-busy");
-    };
-    // The background responds when the fetch actually finishes — re-render
-    // then, with a safety timeout in case the worker dies mid-request.
-    const safety = setTimeout(done, 10_000);
-    chrome.runtime.sendMessage({ type: "FORCE_REFRESH" }, () => {
-      void chrome.runtime.lastError; // swallow; state read still works
-      clearTimeout(safety);
-      done();
-    });
+    // The background responds when the fetch actually finishes; the timeout
+    // covers the worker dying mid-request.
+    await Promise.race([
+      send({ type: "FORCE_REFRESH" }),
+      new Promise((r) => setTimeout(r, 15_000)),
+    ]);
+    await loadAndRender();
+    btn.textContent = "Refresh";
+    btn.disabled = false;
+    btn.removeAttribute("aria-busy");
   });
 
-  document.getElementById("open-usage-btn").addEventListener("click", () => {
+  $("open-usage-btn").addEventListener("click", () => {
     chrome.tabs.create({ url: USAGE_URL });
+  });
+
+  $("pin-btn").addEventListener("click", async () => {
+    await send({ type: "SET_PINNED_ORG", orgId: $("pin-btn").dataset.pin || null });
+    await loadAndRender();
+  });
+
+  $("console-toggle-btn").addEventListener("click", async () => {
+    await send({ type: "CONSOLE_DISABLE" });
+    try {
+      await chrome.permissions.remove(CONSOLE_PERMISSION);
+    } catch {
+      // Not removable (e.g. granted at install in a dev build) — fine.
+    }
+    await loadAndRender();
+  });
+
+  $("console-connect-btn").addEventListener("click", async () => {
+    // Must be the first thing in the click handler (user gesture).
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request(CONSOLE_PERMISSION);
+    } catch {
+      granted = false;
+    }
+    if (!granted) {
+      $("console-cta-text").textContent = "Permission wasn't granted";
+      return;
+    }
+    await send({ type: "CONSOLE_ENABLE" });
+    await loadAndRender();
   });
 });

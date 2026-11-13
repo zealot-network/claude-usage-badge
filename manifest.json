@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Claude Usage Badge",
-  "version": "0.4.1",
-  "description": "Unofficial Claude usage badge: session, weekly limits (all models/Sonnet/Opus/Fable/Design), extra usage, and plan tier.",
+  "version": "0.5.0",
+  "description": "Unofficial Claude usage badge: session and weekly limits, usage credits, plan tier, multiple organizations, and API Console spend.",
   "homepage_url": "https://github.com/zealot-network/claude-usage-badge",
   "minimum_chrome_version": "111",
   "icons": {
@@ -33,15 +33,26 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://claude.ai/*"],
-      "js": ["page-inject.js"],
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "page-inject.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://claude.ai/*"],
-      "js": ["content-script.js"],
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
       "run_at": "document_start"
     }
+  ],
+  "optional_host_permissions": [
+    "https://platform.claude.com/*"
   ]
 }

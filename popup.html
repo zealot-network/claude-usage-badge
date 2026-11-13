@@ -30,8 +30,8 @@
       font-size: 12px;
       color: var(--text);
       background: var(--bg);
-      min-width: 280px;
-      max-width: 280px;
+      min-width: 300px;
+      max-width: 300px;
       padding: 12px;
     }
 
@@ -62,6 +62,136 @@
       border: 1px solid var(--border);
       color: var(--text-muted);
     }
+
+    /* Account switcher — only shown when the login has more than one org. */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 6px;
+    }
+
+    .tab {
+      flex: 1 1 0;
+      min-width: 0;
+      font-family: inherit;
+      text-align: left;
+      padding: 5px 7px;
+      border-radius: 5px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-label);
+      cursor: pointer;
+    }
+
+    .tab:hover { border-color: var(--text-muted); }
+    .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    .tab[aria-pressed="true"] {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+
+    .tab-top {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* State markers are separate elements so they can never be ellipsed away. */
+    .tab-dot {
+      flex: none;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .tab-pin {
+      flex: none;
+      font-size: 9px;
+      line-height: 1;
+      color: var(--accent);
+    }
+
+    .tab-name {
+      flex: 1 1 auto;
+      min-width: 0;
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tab-meta {
+      display: block;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .pin-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+    }
+
+    .link-btn {
+      font-family: inherit;
+      font-size: 10px;
+      color: var(--accent);
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: pointer;
+      text-decoration: underline;
+      white-space: nowrap;
+    }
+
+    .link-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .account-error {
+      font-size: 11px;
+      color: var(--red);
+      line-height: 1.4;
+      margin-bottom: 10px;
+    }
+
+    .console-cta {
+      margin-top: 10px;
+      font-size: 10px;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .console-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      line-height: 1.6;
+    }
+
+    .console-row .k { color: var(--text-label); }
+    .console-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    /* Signed out: cached numbers stay visible but clearly not live. */
+    body.stale #session-slot,
+    body.stale #weekly-primary-slot,
+    body.stale #weekly-secondary-slot,
+    body.stale #daily-group,
+    body.stale #extra-section { opacity: 0.45; }
 
     .section {
       margin-bottom: 14px;
@@ -372,6 +502,14 @@
     <button class="open-usage-btn" id="open-usage-btn">Open claude.ai/settings/usage</button>
   </div>
 
+  <!-- Account switcher (hidden for single-org logins) -->
+  <div class="tabs" id="account-tabs" role="group" aria-label="Claude accounts" style="display:none;"></div>
+  <div class="pin-row" id="pin-row" style="display:none;">
+    <span id="pin-label"></span>
+    <button class="link-btn" id="pin-btn" type="button"></button>
+  </div>
+  <div class="account-error" id="account-error" style="display:none;"></div>
+
   <!-- Session bucket (rendered here, always first) -->
   <div id="session-slot"></div>
 
@@ -407,6 +545,31 @@
     <div id="daily-slot"></div>
   </div>
 
+  <!-- API Console (platform.claude.com) — opt-in, separate permission -->
+  <div id="console-block" style="display:none;">
+  <div class="group-heading">API Console</div>
+  <div class="extra-section" id="console-section" style="margin-top:0;">
+    <div class="extra-header">
+      <span class="extra-label" id="console-title">API usage</span>
+      <button class="link-btn" id="console-toggle-btn" type="button">Disconnect</button>
+    </div>
+    <div class="extra-detail" id="console-detail"></div>
+    <div id="console-rows"></div>
+    <div class="extra-bar-wrap" id="console-bar-wrap" style="display:none;">
+      <div class="bar-track" id="console-bar-track" role="progressbar" aria-label="API spend this month" aria-valuemin="0" aria-valuemax="100">
+        <div class="bar-fill" id="console-bar" style="width: 0%;"></div>
+      </div>
+      <div class="reset-time" id="console-reset"></div>
+    </div>
+  </div>
+  </div>
+  <!-- Collapsed to one line until the user connects it. -->
+  <div class="console-cta" id="console-cta">
+    <span id="console-cta-text">API balance &amp; spend</span>
+    <button class="link-btn" id="console-connect-btn" type="button"
+      title="Shows your API credit balance and this month's API spend. Chrome will ask for access to platform.claude.com.">Connect API Console</button>
+  </div>
+
   <!-- Footer -->
   <div class="footer">
     <span class="meta" id="meta-label">Waiting for data…</span>
@@ -415,6 +578,6 @@
   <div class="error" id="error-label" style="display:none;"></div>
   <div class="disclaimer">Unofficial — not affiliated with Anthropic</div>
 
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>

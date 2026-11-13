@@ -11,14 +11,11 @@
   const TAG = "__CLAUDE_USAGE_BADGE__";
 
   // Patterns whose response bodies are worth forwarding in full.
+  // Only run-budget responses are consumed by the service worker, so only
+  // those are read. Nothing else about the page's traffic leaves this script.
   const SNIFF_PATTERNS = [
     /\/routines?\b/i,
     /\/run[-_]?budget/i,
-    /\/cowork/i,
-    /\/usage/i,
-    /\/schedule[ds]?\b/i,
-    /\/scheduled[-_]?tasks?\b/i,
-    /\/automations?\b/i,
   ];
 
   function post(type, payload) {
@@ -42,6 +39,16 @@
     }
   }
 
+  // Only this site's own API — never clone a response from another origin.
+  function isOwnApi(url) {
+    try {
+      const u = new URL(url, location.origin);
+      return u.origin === location.origin && /^\/(api|v1)\//.test(u.pathname);
+    } catch {
+      return false;
+    }
+  }
+
   function handleResponse(url, response) {
     try {
       if (!url) return;
@@ -50,18 +57,12 @@
         post("COMPLETION_SENT", { url });
       }
 
-      if (url.includes("/api/")) {
-        // Log the URL (no body) for diagnostics so new endpoints can be
-        // discovered by inspection if the sniff patterns miss them.
-        post("API_URL_SEEN", { url });
-
-        if (SNIFF_PATTERNS.some((p) => p.test(url))) {
-          response
-            .clone()
-            .json()
-            .then((body) => post("SNIFFED_PAYLOAD", { url, body }))
-            .catch(() => {});
-        }
+      if (isOwnApi(url) && SNIFF_PATTERNS.some((p) => p.test(url))) {
+        response
+          .clone()
+          .json()
+          .then((body) => post("SNIFFED_PAYLOAD", { url, body }))
+          .catch(() => {});
       }
     } catch {
       // Never break page traffic
@@ -101,8 +102,7 @@
       this.addEventListener("load", function () {
         try {
           const url = this.__cub_url;
-          if (!url || !url.includes("/api/")) return;
-          post("API_URL_SEEN", { url });
+          if (!url || !isOwnApi(url)) return;
           if (SNIFF_PATTERNS.some((p) => p.test(url))) {
             try {
               const body = JSON.parse(this.responseText);

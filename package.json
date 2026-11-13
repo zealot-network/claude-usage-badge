@@ -1,0 +1,17 @@
+{
+  "name": "claude-usage-badge",
+  "private": true,
+  "type": "module",
+  "description": "Dev tooling only — the extension itself has no build step and no runtime dependencies.",
+  "scripts": {
+    "test": "node --test tests/core.test.mjs",
+    "mock": "node dev/mock-server.mjs",
+    "build:dev": "node dev/build-dev.mjs",
+    "test:e2e": "node dev/build-dev.mjs --grant-console && node tests/e2e.mjs && node dev/build-dev.mjs",
+    "store-assets": "node dev/build-dev.mjs --grant-console && node dev/store-assets.mjs && node dev/build-dev.mjs",
+    "package": "node dev/package.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}
