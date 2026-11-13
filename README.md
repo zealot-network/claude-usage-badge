@@ -61,6 +61,8 @@ The extension reads Claude's own usage API — the same data Claude's frontend u
 
 **No data leaves your browser.** No third-party servers. No analytics. No tracking.
 
+See the [Privacy Policy](PRIVACY.md) for exactly what is read and stored, including the Limited Use statement.
+
 ## Development
 
 There's no build step. Edit the files in place and reload the extension at `chrome://extensions` (↻ icon on the extension card). For changes to `content-script.js` or `page-inject.js`, also reload any open `claude.ai` tabs.
